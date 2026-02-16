@@ -1,0 +1,11 @@
+# Runtime files
+settings.json
+*.log
+
+# OS files
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# Claude Code project files
+CLAUDE.md
