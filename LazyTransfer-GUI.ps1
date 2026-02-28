@@ -26,15 +26,23 @@ function Get-AppIcon {
     try {
         Add-Type -TypeDefinition @"
         using System;
+        using System.Drawing;
         using System.Runtime.InteropServices;
         public class IconExtractor {
             [DllImport("shell32.dll", CharSet = CharSet.Auto)]
             public static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool DestroyIcon(IntPtr hIcon);
         }
 "@ -ErrorAction SilentlyContinue
         $iconHandle = [IconExtractor]::ExtractIcon([IntPtr]::Zero, "shell32.dll", 13)
         if ($iconHandle -ne [IntPtr]::Zero) {
-            return [System.Drawing.Icon]::FromHandle($iconHandle)
+            # Clone the icon so we can release the native handle
+            $tempIcon = [System.Drawing.Icon]::FromHandle($iconHandle)
+            $clonedIcon = [System.Drawing.Icon]$tempIcon.Clone()
+            $tempIcon.Dispose()
+            [IconExtractor]::DestroyIcon($iconHandle) | Out-Null
+            return $clonedIcon
         }
     } catch { }
     return [System.Drawing.SystemIcons]::Application
@@ -573,14 +581,22 @@ function Get-InstalledPrograms {
     return $out | Sort-Object DisplayName, DisplayVersion -Unique
 }
 
+$script:InstalledProgramsCache = $null
+
+function Reset-InstalledProgramsCache {
+    $script:InstalledProgramsCache = $null
+}
+
 function Test-ProgramInstalled {
     param([Parameter(Mandatory=$true)][string]$DisplayName)
-    $programs = Get-InstalledPrograms
+    if (-not $script:InstalledProgramsCache) {
+        $script:InstalledProgramsCache = Get-InstalledPrograms
+    }
     $searchName = $DisplayName.ToLowerInvariant()
-    foreach ($p in $programs) {
+    foreach ($p in $script:InstalledProgramsCache) {
         $progName = $p.DisplayName.ToLowerInvariant()
-        if ($progName -eq $searchName -or $progName.Contains($searchName) -or $searchName.Contains($progName)) { 
-            return $true 
+        if ($progName -eq $searchName -or $progName.Contains($searchName) -or $searchName.Contains($progName)) {
+            return $true
         }
     }
     return $false
@@ -621,7 +637,8 @@ function Build-ScanBundle {
     $safeClientName = [System.Web.HttpUtility]::HtmlEncode($ClientName)
     $safeScanTime = [System.Web.HttpUtility]::HtmlEncode($meta.ScanTime)
     $safeComputerName = [System.Web.HttpUtility]::HtmlEncode($meta.ComputerName)
-    $htmlContent = @"
+    $htmlBuilder = New-Object System.Text.StringBuilder 4096
+    [void]$htmlBuilder.Append(@"
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>$safeClientName - Program List</title>
 <style>
@@ -636,14 +653,15 @@ tr:nth-child(even) { background: #2a2a2a; }
 <h2>LazyTransfer - Program List</h2>
 <div class="meta">Client: $safeClientName | Scanned: $safeScanTime | PC: $safeComputerName</div>
 <table><tr><th>Name</th><th>Version</th><th>Publisher</th></tr>
-"@
+"@)
     foreach ($p in $programs) {
         $n = [System.Web.HttpUtility]::HtmlEncode($p.DisplayName)
         $v = [System.Web.HttpUtility]::HtmlEncode($p.DisplayVersion)
         $pub = [System.Web.HttpUtility]::HtmlEncode($p.Publisher)
-        $htmlContent += "<tr><td>$n</td><td>$v</td><td>$pub</td></tr>`n"
+        [void]$htmlBuilder.AppendLine("<tr><td>$n</td><td>$v</td><td>$pub</td></tr>")
     }
-    $htmlContent += "</table></body></html>"
+    [void]$htmlBuilder.Append("</table></body></html>")
+    $htmlContent = $htmlBuilder.ToString()
     $htmlContent | Set-Content -Path $htmlPath -Encoding UTF8
 
     Write-Log "Saved: programs.json, programs.csv, report.html"
@@ -662,6 +680,7 @@ function Start-FilesMigration {
         [Parameter(Mandatory=$true)][string[]]$SelectedFolders,
         [Parameter(Mandatory=$true)][string]$Mode,
         [string[]]$SelectedBrowsers = @(),
+        [hashtable]$PrecomputedSizes = $null,
         [scriptblock]$OnProgress
     )
 
@@ -675,20 +694,29 @@ function Start-FilesMigration {
     Write-Log "Starting files migration for: $ClientName"
     Write-Log "Mode: $Mode | Folders: $($SelectedFolders -join ', ')"
 
-    # Calculate total size for progress tracking
+    # Use pre-computed sizes if available, otherwise calculate
     $totalBytes = [long]0
     $folderSizes = @{}
-    foreach ($name in $SelectedFolders) {
-        $path = Get-UserFolderPath -FolderName $name
-        if ($path -and (Test-Path $path)) {
-            try {
-                $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
-                $size = if ($measure.Sum) { [long]$measure.Sum } else { 0 }
-                $folderSizes[$name] = $size
-                $totalBytes += $size
-            } catch { $folderSizes[$name] = 0 }
-        } else { $folderSizes[$name] = 0 }
-        Update-GuiStatus
+    if ($PrecomputedSizes) {
+        foreach ($name in $SelectedFolders) {
+            $size = if ($PrecomputedSizes.ContainsKey($name)) { [long]$PrecomputedSizes[$name] } else { 0 }
+            $folderSizes[$name] = $size
+            $totalBytes += $size
+        }
+        Write-Log "Using pre-computed folder sizes"
+    } else {
+        foreach ($name in $SelectedFolders) {
+            $path = Get-UserFolderPath -FolderName $name
+            if ($path -and (Test-Path $path)) {
+                try {
+                    $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $size = if ($measure.Sum) { [long]$measure.Sum } else { 0 }
+                    $folderSizes[$name] = $size
+                    $totalBytes += $size
+                } catch { $folderSizes[$name] = 0 }
+            } else { $folderSizes[$name] = 0 }
+            Update-GuiStatus
+        }
     }
 
     # Check available disk space (skip for UNC paths)
@@ -697,8 +725,9 @@ function Start-FilesMigration {
             $destDrive = Split-Path -Qualifier $OutputFolder
             if ($destDrive) {
                 $driveInfo = Get-PSDrive -Name ($destDrive.TrimEnd(':')) -ErrorAction SilentlyContinue
-                if ($driveInfo -and $driveInfo.Free -lt ($totalBytes * 1.1)) {
-                    throw "Insufficient disk space. Need $(Format-FileSize ($totalBytes * 1.1)), have $(Format-FileSize $driveInfo.Free)."
+                $spaceMultiplier = if ($Mode -eq "zip") { 2.2 } else { 1.1 }
+                if ($driveInfo -and $driveInfo.Free -lt ($totalBytes * $spaceMultiplier)) {
+                    throw "Insufficient disk space. Need $(Format-FileSize ([long]($totalBytes * $spaceMultiplier))), have $(Format-FileSize $driveInfo.Free)."
                 }
             }
         } catch [System.Management.Automation.RuntimeException] { throw }
@@ -713,6 +742,11 @@ function Start-FilesMigration {
 
     # Copy each selected folder
     foreach ($name in $SelectedFolders) {
+        if ($script:CancelRequested) {
+            Write-Log "File migration cancelled by user" -Level 'WARN'
+            $errors += "Cancelled by user"
+            break
+        }
         $currentFolder++
         $srcPath = Get-UserFolderPath -FolderName $name
         if (-not $srcPath -or -not (Test-Path $srcPath)) {
@@ -740,8 +774,12 @@ function Start-FilesMigration {
             } else {
                 Write-Log "[X] $name copy had errors (robocopy exit: $($roboProcess.ExitCode))" -Level 'ERROR'
                 $errors += "Robocopy error for $name (exit code $($roboProcess.ExitCode))"
-                # Still count partial copy
-                $copiedBytes += $folderSizes[$name]
+                # Count only actually copied bytes for accurate progress
+                try {
+                    $partialMeasure = Get-ChildItem -Path $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $copiedBytes += if ($partialMeasure.Sum) { [long]$partialMeasure.Sum } else { 0 }
+                    $copiedFiles += $partialMeasure.Count
+                } catch { }
             }
         } catch {
             Write-Log "[X] Failed to copy $name`: $($_.Exception.Message)" -Level 'ERROR'
@@ -779,6 +817,10 @@ function Start-FilesMigration {
         Bookmarks      = $exportedBrowsers
         Errors         = $errors
     }
+    # Write manifest before ZIP so it's included in the archive
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $migrationFolder "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-Log "Migration manifest saved"
+
     # ZIP mode: compress and remove temp folder
     $finalPath = $migrationFolder
     if ($Mode -eq "zip") {
@@ -799,14 +841,6 @@ function Start-FilesMigration {
 
         if ($OnProgress) { & $OnProgress "Complete" $totalBytes $totalBytes $totalFolders $totalFolders "Done" }
     }
-
-    # Write manifest AFTER ZIP step so errors are captured
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $finalPath "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
-    if (-not (Test-Path (Join-Path $finalPath "migration-manifest.json"))) {
-        # If finalPath is a zip, write manifest alongside it
-        $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path (Split-Path $finalPath) "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-    Write-Log "Migration manifest saved"
 
     try { Stop-Transcript | Out-Null } catch { }
 
@@ -1026,6 +1060,9 @@ function Install-ProgramsFromBundle {
     $chocoOk = Ensure-Chocolatey -AutoInstall:$AutoInstallChocolatey
     Write-Log "Chocolatey: $(if ($chocoOk) { 'Ready' } else { 'Not available' })"
 
+    # Reset the installed programs cache so verification reads fresh data
+    Reset-InstalledProgramsCache
+
     $results = @()
     $manualQueue = @()
     $failedQueue = @()
@@ -1035,9 +1072,13 @@ function Install-ProgramsFromBundle {
     $current = 0
 
     foreach ($name in $SelectedDisplayNames) {
+        if ($script:CancelRequested) {
+            Write-Log "Installation cancelled by user" -Level 'WARN'
+            break
+        }
         $current++
         if ($OnProgress) { & $OnProgress $name $current $total "Processing..." }
-        
+
         if (Test-IsNoiseAppName -DisplayName $name) {
             $results += [PSCustomObject]@{ DisplayName=$name; Status="Skipped"; Method="Noise"; Verified=$false }
             continue
@@ -1063,6 +1104,7 @@ function Install-ProgramsFromBundle {
                     $method = "Winget"
                     $installed = $true
                     Start-Sleep -Milliseconds 500
+                    Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
                     if (-not $verified) { $stillMissing += $name }
                 }
@@ -1078,6 +1120,7 @@ function Install-ProgramsFromBundle {
                     $method = "Chocolatey"
                     $installed = $true
                     Start-Sleep -Milliseconds 500
+                    Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
                     if (-not $verified) { $stillMissing += $name }
                 }
@@ -1133,6 +1176,7 @@ $script:StatusLabel = $null
 $script:ContentPanel = $null
 $script:SidebarButtons = @{}
 $script:OperationInProgress = $false
+$script:CancelRequested = $false
 $script:LastMigrationPath = $null
 
 function New-StyledButton {
@@ -1315,6 +1359,7 @@ function Show-InstallPage {
     $script:InstallAllPrograms = @()
     $script:InstallManualQueue = @()
     $script:InstallFailedQueue = @()
+    $script:InstallCheckStates = @{}
     
     $title = New-Object System.Windows.Forms.Label
     $title.Text = "Install Programs"
@@ -1384,7 +1429,7 @@ function Show-InstallPage {
     $script:CategoryCounts = @{}
 
     # Create category buttons
-    $categoryList = @('Browsers', 'DevTools', 'Media', 'Office', 'Communication', 'Utilities', 'Gaming', 'Security', 'Other')
+    $categoryList = @('Browsers', 'DevTools', 'Media', 'Graphics', 'Office', 'Communication', 'Utilities', 'Gaming', 'Security', 'Other')
     foreach ($cat in $categoryList) {
         $catInfo = Get-CategoryInfo -Category $cat
         $catBtn = New-Object System.Windows.Forms.Button
@@ -1411,6 +1456,13 @@ function Show-InstallPage {
     $listPrograms.ForeColor = $script:Colors.TextPrimary
     $listPrograms.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $listPrograms.CheckOnClick = $true
+
+    # Track user check state changes
+    $listPrograms.Add_ItemCheck({
+        param($sender, $e)
+        $itemName = [string]$sender.Items[$e.Index]
+        $script:InstallCheckStates[$itemName] = ($e.NewValue -eq [System.Windows.Forms.CheckState]::Checked)
+    }.GetNewClosure())
 
     # Wire up category button click handlers
     foreach ($cat in $categoryList) {
@@ -1511,12 +1563,21 @@ function Show-InstallPage {
     $btnInstall.Location = New-Object System.Drawing.Point(230, 465)
     $btnInstall.Enabled = $false
     
+    $btnCancel = New-StyledButton -Text "Cancel" -Width 80 -Height 35 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnCancel.Location = New-Object System.Drawing.Point(405, 465)
+    $btnCancel.Visible = $false
+    $btnCancel.Add_Click({
+        $script:CancelRequested = $true
+        $btnCancel.Enabled = $false
+        $btnCancel.Text = "Stopping..."
+    }.GetNewClosure())
+
     $btnRetry = New-StyledButton -Text "Retry Failed" -Width 100 -Height 30 -BackColor $script:Colors.AccentOrange -ForeColor $script:Colors.TextDark
-    $btnRetry.Location = New-Object System.Drawing.Point(440, 465)
+    $btnRetry.Location = New-Object System.Drawing.Point(500, 465)
     $btnRetry.Enabled = $false
-    
+
     $btnManual = New-StyledButton -Text "Open Manual" -Width 100 -Height 30 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
-    $btnManual.Location = New-Object System.Drawing.Point(545, 465)
+    $btnManual.Location = New-Object System.Drawing.Point(605, 465)
     $btnManual.Enabled = $false
     
     $btnBrowseBundle.Add_Click({
@@ -1555,8 +1616,11 @@ function Show-InstallPage {
             # Reset category counts
             foreach ($cat in $script:CategoryCounts.Keys) { $script:CategoryCounts[$cat] = 0 }
 
+            # Initialize check states
+            $script:InstallCheckStates = @{}
             foreach ($p in $script:InstallAllPrograms) {
                 $checked = -not (Test-IsNoiseAppName -DisplayName $p.Name)
+                $script:InstallCheckStates[$p.Name] = $checked
                 [void]$listPrograms.Items.Add($p.Name, $checked)
                 # Count categories
                 if ($script:CategoryCounts.ContainsKey($p.Category)) {
@@ -1598,7 +1662,7 @@ function Show-InstallPage {
         foreach ($p in $script:InstallAllPrograms) {
             $searchText = "$($p.Name) $($p.Publisher)".ToLowerInvariant()
             if ([string]::IsNullOrWhiteSpace($filter) -or $searchText.Contains($filter)) {
-                $checked = -not (Test-IsNoiseAppName -DisplayName $p.Name)
+                $checked = if ($script:InstallCheckStates.ContainsKey($p.Name)) { $script:InstallCheckStates[$p.Name] } else { -not (Test-IsNoiseAppName -DisplayName $p.Name) }
                 [void]$listPrograms.Items.Add($p.Name, $checked)
             }
         }
@@ -1632,6 +1696,10 @@ function Show-InstallPage {
             $btnRetry.Enabled = $false
             $btnManual.Enabled = $false
             $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnCancel.Visible = $true
+            $btnCancel.Enabled = $true
+            $btnCancel.Text = "Cancel"
             $txtResults.Clear()
             $progress.Maximum = $selected.Count
             $progress.Value = 0
@@ -1735,10 +1803,12 @@ function Show-InstallPage {
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         } finally {
             $script:OperationInProgress = $false
+            $script:CancelRequested = $false
             $btnInstall.Enabled = $true
+            $btnCancel.Visible = $false
         }
     }.GetNewClosure())
-    
+
     $btnRetry.Add_Click({
         for ($i = 0; $i -lt $listPrograms.Items.Count; $i++) {
             $name = [string]$listPrograms.Items[$i]
@@ -1763,7 +1833,7 @@ function Show-InstallPage {
         $btnManual.Enabled = $false
     }.GetNewClosure())
     
-    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $lblBundle, $txtBundle, $btnBrowseBundle, $btnLoad, $lblFilter, $txtFilter, $categoryPanel, $listPrograms, $lblResults, $txtResults, $progressPanel, $btnSelectAll, $btnSelectNone, $btnInstall, $btnRetry, $btnManual))
+    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $lblBundle, $txtBundle, $btnBrowseBundle, $btnLoad, $lblFilter, $txtFilter, $categoryPanel, $listPrograms, $lblResults, $txtResults, $progressPanel, $btnSelectAll, $btnSelectNone, $btnInstall, $btnCancel, $btnRetry, $btnManual))
 }
 
 function Show-FilesPage {
@@ -1937,6 +2007,16 @@ function Show-FilesPage {
     $btnStartMigration.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
     $btnStartMigration.Location = New-Object System.Drawing.Point(20, 390)
 
+    $btnCancelMigration = New-StyledButton -Text "Cancel" -Width 100 -Height 45 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnCancelMigration.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $btnCancelMigration.Location = New-Object System.Drawing.Point(250, 390)
+    $btnCancelMigration.Visible = $false
+    $btnCancelMigration.Add_Click({
+        $script:CancelRequested = $true
+        $btnCancelMigration.Enabled = $false
+        $btnCancelMigration.Text = "Stopping..."
+    }.GetNewClosure())
+
     # --- Progress Panel (hidden initially) ---
     $progressPanel = New-Object System.Windows.Forms.Panel
     $progressPanel.Location = New-Object System.Drawing.Point(20, 445)
@@ -2052,8 +2132,12 @@ function Show-FilesPage {
 
             # Disable controls during migration
             $script:OperationInProgress = $true
+            $script:CancelRequested = $false
             $btnStartMigration.Enabled = $false
             $btnStartMigration.Text = "Migrating..."
+            $btnCancelMigration.Visible = $true
+            $btnCancelMigration.Enabled = $true
+            $btnCancelMigration.Text = "Cancel"
             $listFolders.Enabled = $false
             $resultsPanel.Visible = $false
             $btnOpenFolder.Visible = $false
@@ -2092,7 +2176,7 @@ function Show-FilesPage {
             }
 
             $clientName = $env:COMPUTERNAME
-            $result = Start-FilesMigration -ClientName $clientName -OutputFolder $txtSaveLocation.Text -SelectedFolders $selected -Mode $mode -SelectedBrowsers $browsers -OnProgress $progressCallback
+            $result = Start-FilesMigration -ClientName $clientName -OutputFolder $txtSaveLocation.Text -SelectedFolders $selected -Mode $mode -SelectedBrowsers $browsers -PrecomputedSizes $script:FilesFolderSizes -OnProgress $progressCallback
 
             # Show results
             $progressPanel.Visible = $false
@@ -2123,8 +2207,10 @@ function Show-FilesPage {
             $progressPanel.Visible = $false
         } finally {
             $script:OperationInProgress = $false
+            $script:CancelRequested = $false
             $btnStartMigration.Enabled = $true
             $btnStartMigration.Text = "Start Migration"
+            $btnCancelMigration.Visible = $false
             $listFolders.Enabled = $true
         }
     }.GetNewClosure())
@@ -2136,11 +2222,11 @@ function Show-FilesPage {
         $lblBrowsers, $chkChrome, $chkFirefox, $chkEdge,
         $lblMode, $rdoZip, $rdoDirect,
         $lblSave, $txtSaveLocation, $btnBrowseSave,
-        $btnStartMigration,
+        $btnStartMigration, $btnCancelMigration,
         $progressPanel, $resultsPanel
     ))
 
-    # Async folder size calculation
+    # Folder size calculation (updates UI incrementally via DoEvents)
     $sizeCallback = {
         param($folderName, $sizeBytes, $fileCount)
         $script:FilesFolderSizes[$folderName] = $sizeBytes
