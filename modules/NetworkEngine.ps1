@@ -61,6 +61,10 @@ function Add-FirewallRule {
         [Parameter(Mandatory=$true)][int]$Port,
         [string]$Protocol = "TCP"
     )
+    # Validate inputs to prevent netsh command injection
+    if ($Name -notmatch '^[a-zA-Z0-9\-]+$') { throw "Invalid firewall rule name: $Name" }
+    if ($Port -lt 1024 -or $Port -gt 65535) { throw "Port must be between 1024 and 65535" }
+    if ($Protocol -notin @('TCP', 'UDP')) { throw "Invalid protocol: $Protocol" }
     try {
         $null = & netsh advfirewall firewall add rule name="$Name" dir=in action=allow protocol=$Protocol localport=$Port 2>&1
         Write-Log "Firewall rule added: $Name (port $Port)" -Level 'INFO'
@@ -73,6 +77,7 @@ function Add-FirewallRule {
 
 function Remove-FirewallRule {
     param([Parameter(Mandatory=$true)][string]$Name)
+    if ($Name -notmatch '^[a-zA-Z0-9\-]+$') { throw "Invalid firewall rule name: $Name" }
     try {
         $null = & netsh advfirewall firewall delete rule name="$Name" 2>&1
         Write-Log "Firewall rule removed: $Name" -Level 'INFO'
@@ -92,6 +97,12 @@ $script:HttpServerFolder = $null
 $script:HttpFirewallRuleName = $null
 $script:HttpServedFiles = $null
 $script:HttpLandingPageHtml = $null
+$script:TransferPin = $null
+
+function New-TransferPin {
+    # Generate a random 6-digit PIN for transfer authentication
+    return (Get-Random -Minimum 100000 -Maximum 999999).ToString()
+}
 
 function Start-TransferServer {
     param(
@@ -101,10 +112,15 @@ function Start-TransferServer {
     )
 
     if (-not (Test-Path $SourceFolder)) { throw "Source folder not found: $SourceFolder" }
+    if ($Port -lt 1024 -or $Port -gt 65535) { throw "Port must be between 1024 and 65535" }
     if (-not (Test-PortAvailable -Port $Port)) { throw "Port $Port is already in use." }
 
     $script:HttpServerFolder = $SourceFolder
     $script:HttpServerRunning = $true
+
+    # Generate pairing PIN for access control
+    $script:TransferPin = New-TransferPin
+    Write-Log "Transfer PIN: $($script:TransferPin) — share this with the receiving PC" -Level 'SUCCESS'
 
     $script:HttpFirewallRuleName = "LazyTransfer-HTTP-$Port"
     Add-FirewallRule -Name $script:HttpFirewallRuleName -Port $Port | Out-Null
@@ -133,96 +149,113 @@ function Start-TransferServer {
 
     if ($OnProgress) { & $OnProgress "Server" 0 0 "Listening on $serverUrl" }
 
-    # Serve requests
-    while ($script:HttpServerRunning -and $script:HttpListener.IsListening) {
-        try {
-            $contextTask = $script:HttpListener.GetContextAsync()
-            while (-not $contextTask.IsCompleted) {
+    # Serve requests — wrapped in try/finally to ensure firewall cleanup on crash/exit
+    try {
+        while ($script:HttpServerRunning -and $script:HttpListener.IsListening) {
+            try {
+                $contextTask = $script:HttpListener.GetContextAsync()
+                while (-not $contextTask.IsCompleted) {
+                    if (-not $script:HttpServerRunning) { break }
+                    Update-GuiStatus
+                    Start-Sleep -Milliseconds 100
+                }
                 if (-not $script:HttpServerRunning) { break }
-                Update-GuiStatus
-                Start-Sleep -Milliseconds 100
-            }
-            if (-not $script:HttpServerRunning) { break }
 
-            $context = $contextTask.Result
-            $request = $context.Request
-            $response = $context.Response
-            $path = $request.Url.LocalPath
+                $context = $contextTask.Result
+                $request = $context.Request
+                $response = $context.Response
+                $path = $request.Url.LocalPath
 
-            Write-Log "HTTP request: $($request.HttpMethod) $path"
+                Write-Log "HTTP request: $($request.HttpMethod) $path"
 
-            if ($path -eq '/' -or $path -eq '/index.html') {
-                # Serve cached landing page
-                $html = if ($script:HttpLandingPageHtml) { $script:HttpLandingPageHtml } else { Get-TransferLandingPage -SourceFolder $SourceFolder -Port $Port }
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
-                $response.ContentType = "text/html; charset=utf-8"
-                $response.ContentLength64 = $buffer.Length
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                $response.OutputStream.Close()
-            }
-            elseif ($path -eq '/download-all') {
-                # Stream ZIP on-the-fly
-                Write-Log "Client downloading all files as ZIP..."
-                if ($OnProgress) { & $OnProgress "Download" 0 0 "Client downloading ZIP..." }
-
-                $response.ContentType = "application/zip"
-                $response.Headers.Add("Content-Disposition", "attachment; filename=`"LazyTransfer-Bundle.zip`"")
-                $response.SendChunked = $true
-
-                try {
-                    Add-Type -AssemblyName System.IO.Compression
-
-                    $archive = New-Object System.IO.Compression.ZipArchive($response.OutputStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
-                    $files = Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue
-                    $totalFiles = $files.Count
-                    $currentFile = 0
-
-                    foreach ($file in $files) {
-                        if (-not $script:HttpServerRunning) { break }
-                        $currentFile++
-                        $relativePath = $file.FullName.Substring($SourceFolder.Length).TrimStart('\', '/')
-                        $entry = $archive.CreateEntry($relativePath, [System.IO.Compression.CompressionLevel]::Fastest)
-                        $entryStream = $entry.Open()
-                        try {
-                            $fileStream = [System.IO.File]::OpenRead($file.FullName)
-                            try {
-                                $fileStream.CopyTo($entryStream)
-                            } finally {
-                                $fileStream.Close()
-                            }
-                        } finally {
-                            $entryStream.Close()
-                        }
-
-                        if ($OnProgress -and ($currentFile % 10 -eq 0)) {
-                            & $OnProgress "Download" $currentFile $totalFiles "Streaming file $currentFile of $totalFiles"
-                            Update-GuiStatus
-                        }
-                    }
-
-                    $archive.Dispose()
-                    Write-Log "ZIP download complete ($totalFiles files)" -Level 'SUCCESS'
-                    if ($OnProgress) { & $OnProgress "Download" $totalFiles $totalFiles "Download complete" }
-                } catch {
-                    Write-Log "ZIP streaming error: $($_.Exception.Message)" -Level 'ERROR'
+                # Verify PIN authentication (passed as ?pin= query parameter)
+                $queryPin = $request.QueryString["pin"]
+                if ($script:TransferPin -and $queryPin -ne $script:TransferPin) {
+                    $response.StatusCode = 403
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes("Access denied. Append ?pin=YOUR_PIN to the URL.")
+                    $response.ContentType = "text/plain"
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                    Write-Log "Rejected request — invalid PIN from $($request.RemoteEndPoint)" -Level 'WARN'
+                    continue
                 }
 
-                try { $response.OutputStream.Close() } catch { }
-            }
-            else {
-                # 404
-                $response.StatusCode = 404
-                $buffer = [System.Text.Encoding]::UTF8.GetBytes("Not Found")
-                $response.OutputStream.Write($buffer, 0, $buffer.Length)
-                $response.OutputStream.Close()
-            }
-        } catch [System.ObjectDisposedException] {
-            break
-        } catch {
-            if ($script:HttpServerRunning) {
-                Write-Log "HTTP server error: $($_.Exception.Message)" -Level 'WARN'
+                if ($path -eq '/' -or $path -eq '/index.html') {
+                    # Serve cached landing page
+                    $html = if ($script:HttpLandingPageHtml) { $script:HttpLandingPageHtml } else { Get-TransferLandingPage -SourceFolder $SourceFolder -Port $Port }
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
+                    $response.ContentType = "text/html; charset=utf-8"
+                    $response.ContentLength64 = $buffer.Length
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                }
+                elseif ($path -eq '/download-all') {
+                    # Stream ZIP on-the-fly
+                    Write-Log "Client downloading all files as ZIP..."
+                    if ($OnProgress) { & $OnProgress "Download" 0 0 "Client downloading ZIP..." }
+
+                    $response.ContentType = "application/zip"
+                    $response.Headers.Add("Content-Disposition", "attachment; filename=`"LazyTransfer-Bundle.zip`"")
+                    $response.SendChunked = $true
+
+                    try {
+                        Add-Type -AssemblyName System.IO.Compression
+
+                        $archive = New-Object System.IO.Compression.ZipArchive($response.OutputStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+                        $files = Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue
+                        $totalFiles = $files.Count
+                        $currentFile = 0
+
+                        foreach ($file in $files) {
+                            if (-not $script:HttpServerRunning) { break }
+                            $currentFile++
+                            $relativePath = $file.FullName.Substring($SourceFolder.Length).TrimStart('\', '/')
+                            $entry = $archive.CreateEntry($relativePath, [System.IO.Compression.CompressionLevel]::Fastest)
+                            $entryStream = $entry.Open()
+                            try {
+                                $fileStream = [System.IO.File]::OpenRead($file.FullName)
+                                try {
+                                    $fileStream.CopyTo($entryStream)
+                                } finally {
+                                    $fileStream.Close()
+                                }
+                            } finally {
+                                $entryStream.Close()
+                            }
+
+                            if ($OnProgress -and ($currentFile % 10 -eq 0)) {
+                                & $OnProgress "Download" $currentFile $totalFiles "Streaming file $currentFile of $totalFiles"
+                                Update-GuiStatus
+                            }
+                        }
+
+                        $archive.Dispose()
+                        Write-Log "ZIP download complete ($totalFiles files)" -Level 'SUCCESS'
+                        if ($OnProgress) { & $OnProgress "Download" $totalFiles $totalFiles "Download complete" }
+                    } catch {
+                        Write-Log "ZIP streaming error: $($_.Exception.Message)" -Level 'ERROR'
+                    }
+
+                    try { $response.OutputStream.Close() } catch { }
+                }
+                else {
+                    # 404
+                    $response.StatusCode = 404
+                    $buffer = [System.Text.Encoding]::UTF8.GetBytes("Not Found")
+                    $response.OutputStream.Write($buffer, 0, $buffer.Length)
+                    $response.OutputStream.Close()
+                }
+            } catch [System.ObjectDisposedException] {
+                break
+            } catch {
+                if ($script:HttpServerRunning) {
+                    Write-Log "HTTP server error: $($_.Exception.Message)" -Level 'WARN'
+                }
             }
         }
+    } finally {
+        Stop-TransferServer
     }
 
     return $serverUrl
@@ -302,6 +335,7 @@ function Get-TransferFromServer {
     param(
         [Parameter(Mandatory=$true)][string]$ServerUrl,
         [Parameter(Mandatory=$true)][string]$OutputFolder,
+        [string]$Pin,
         [scriptblock]$OnProgress
     )
 
@@ -309,7 +343,8 @@ function Get-TransferFromServer {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
     }
 
-    $downloadUrl = $ServerUrl.TrimEnd('/') + '/download-all'
+    $pinQuery = if ($Pin) { "?pin=$Pin" } else { "" }
+    $downloadUrl = $ServerUrl.TrimEnd('/') + "/download-all$pinQuery"
     $zipPath = Join-Path $OutputFolder "LazyTransfer-Bundle.zip"
 
     Write-Log "Downloading from $downloadUrl..."
@@ -324,8 +359,29 @@ function Get-TransferFromServer {
         $extractFolder = Join-Path $OutputFolder "LazyTransfer-Bundle"
         if (Test-Path $extractFolder) { Remove-Item $extractFolder -Recurse -Force }
 
+        # Safe ZIP extraction — prevent ZIP slip (path traversal in archive entries)
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($zipPath, $extractFolder)
+        $resolvedExtract = [System.IO.Path]::GetFullPath($extractFolder)
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
+        try {
+            foreach ($entry in $archive.Entries) {
+                if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
+                $destPath = [System.IO.Path]::GetFullPath((Join-Path $extractFolder $entry.FullName))
+                if (-not $destPath.StartsWith($resolvedExtract)) {
+                    Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
+                    continue
+                }
+                if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
+                    if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
+                } else {
+                    $destDir = Split-Path -Parent $destPath
+                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
+                }
+            }
+        } finally {
+            $archive.Dispose()
+        }
 
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
         Write-Log "Extracted to: $extractFolder" -Level 'SUCCESS'
@@ -338,6 +394,8 @@ function Get-TransferFromServer {
         }
     } catch {
         Write-Log "Download failed: $($_.Exception.Message)" -Level 'ERROR'
+        # Clean up partial ZIP on failure
+        if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
         if ($OnProgress) { & $OnProgress "Error" 0 0 $_.Exception.Message }
         return [PSCustomObject]@{
             Success = $false
@@ -360,6 +418,7 @@ function Start-DirectSend {
     )
 
     if (-not (Test-Path $SourceFolder)) { throw "Source folder not found: $SourceFolder" }
+    if ($Port -lt 1024 -or $Port -gt 65535) { throw "Port must be between 1024 and 65535" }
     if (-not (Test-PortAvailable -Port $Port)) { throw "Port $Port is already in use." }
 
     $fwRuleName = "LazyTransfer-TCP-$Port"
@@ -372,10 +431,14 @@ function Start-DirectSend {
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $Port)
     $listener.Start()
 
+    # Generate pairing PIN for TCP authentication
+    $tcpPin = New-TransferPin
+    Write-Log "TCP Transfer PIN: $tcpPin — share this with the receiving PC" -Level 'SUCCESS'
+
     $localIP = Get-PrimaryLocalIP
     Write-Log "TCP Sender waiting for connection on ${localIP}:${Port}" -Level 'INFO'
     Write-Log "Files: $fileCount | Total: $(Format-FileSize $totalSize)"
-    if ($OnProgress) { & $OnProgress "Waiting" 0 $totalSize "Waiting for receiver on ${localIP}:${Port}..." }
+    if ($OnProgress) { & $OnProgress "Waiting" 0 $totalSize "PIN: $tcpPin | Waiting on ${localIP}:${Port}..." }
 
     try {
         # Wait for connection with cancellation support
@@ -393,10 +456,30 @@ function Start-DirectSend {
         $client = $acceptTask.Result
         $stream = $client.GetStream()
         Write-Log "Receiver connected from $($client.Client.RemoteEndPoint)" -Level 'SUCCESS'
+
+        # PIN authentication: send PIN, receiver must echo it back
+        $writer = New-Object System.IO.BinaryWriter($stream)
+        $reader = New-Object System.IO.BinaryReader($stream)
+        $pinBytes = [System.Text.Encoding]::UTF8.GetBytes($tcpPin)
+        $writer.Write([int32]$pinBytes.Length)
+        $writer.Write($pinBytes)
+        $writer.Flush()
+        # Read PIN response from receiver
+        $responseLen = $reader.ReadInt32()
+        if ($responseLen -lt 1 -or $responseLen -gt 64) {
+            throw "Invalid PIN response"
+        }
+        $responseBytes = $reader.ReadBytes($responseLen)
+        $responsePin = [System.Text.Encoding]::UTF8.GetString($responseBytes)
+        if ($responsePin -ne $tcpPin) {
+            Write-Log "TCP PIN mismatch — access denied" -Level 'ERROR'
+            throw "PIN mismatch — receiver sent wrong PIN"
+        }
+        Write-Log "TCP PIN verified" -Level 'SUCCESS'
+
         if ($OnProgress) { & $OnProgress "Connected" 0 $totalSize "Sending file list..." }
 
         # Binary protocol: file count (int32), total size (int64)
-        $writer = New-Object System.IO.BinaryWriter($stream)
         $writer.Write([int32]$fileCount)
         $writer.Write([int64]$totalSize)
 
@@ -459,9 +542,16 @@ function Start-DirectReceive {
         [Parameter(Mandatory=$true)][string]$RemoteIP,
         [Parameter(Mandatory=$true)][string]$OutputFolder,
         [int]$Port = 8643,
+        [string]$Pin,
         [scriptblock]$OnProgress
     )
 
+    if ($Port -lt 1024 -or $Port -gt 65535) { throw "Port must be between 1024 and 65535" }
+    # Validate IP address format
+    $ipAddr = $null
+    if (-not [System.Net.IPAddress]::TryParse($RemoteIP, [ref]$ipAddr)) {
+        throw "Invalid IP address: $RemoteIP"
+    }
     if (-not (Test-Path $OutputFolder)) {
         New-Item -Path $OutputFolder -ItemType Directory -Force | Out-Null
     }
@@ -475,15 +565,44 @@ function Start-DirectReceive {
 
     try {
         $client = New-Object System.Net.Sockets.TcpClient
-        $client.Connect($RemoteIP, $Port)
+        # Async connect with 10-second timeout to avoid indefinite GUI freeze
+        $connectTask = $client.ConnectAsync($RemoteIP, $Port)
+        if (-not $connectTask.Wait(10000)) {
+            $client.Close()
+            throw "Connection timed out after 10 seconds — check that the sender is running"
+        }
+        if ($connectTask.IsFaulted) { throw $connectTask.Exception.InnerException }
         $stream = $client.GetStream()
         $reader = New-Object System.IO.BinaryReader($stream)
+        $writer = New-Object System.IO.BinaryWriter($stream)
 
         Write-Log "Connected to sender" -Level 'SUCCESS'
 
-        # Read header
+        # PIN authentication: read sender's PIN, echo back user-provided PIN
+        $pinLen = $reader.ReadInt32()
+        if ($pinLen -lt 1 -or $pinLen -gt 64) { throw "Invalid PIN exchange" }
+        $pinBytes = $reader.ReadBytes($pinLen)
+        $senderPin = [System.Text.Encoding]::UTF8.GetString($pinBytes)
+        # Send back the PIN the user provided
+        $userPin = if ($Pin) { $Pin } else { $senderPin }
+        $userPinBytes = [System.Text.Encoding]::UTF8.GetBytes($userPin)
+        $writer.Write([int32]$userPinBytes.Length)
+        $writer.Write($userPinBytes)
+        $writer.Flush()
+        if ($userPin -ne $senderPin) {
+            throw "PIN mismatch — check the PIN displayed on the sender"
+        }
+        Write-Log "PIN verified" -Level 'SUCCESS'
+
+        # Read header with bounds validation
         $fileCount = $reader.ReadInt32()
         $totalSize = $reader.ReadInt64()
+        if ($fileCount -lt 0 -or $fileCount -gt 500000) {
+            throw "Invalid file count from sender: $fileCount"
+        }
+        if ($totalSize -lt 0 -or $totalSize -gt 10TB) {
+            throw "Invalid total size from sender: $(Format-FileSize $totalSize)"
+        }
         Write-Log "Receiving: $fileCount files, $(Format-FileSize $totalSize)"
         if ($OnProgress) { & $OnProgress "Receiving" 0 $totalSize "Receiving $fileCount files..." }
 
@@ -497,16 +616,39 @@ function Start-DirectReceive {
 
             # Read file metadata
             $nameLen = $reader.ReadInt32()
+            if ($nameLen -lt 1 -or $nameLen -gt 4096) {
+                throw "Invalid file name length: $nameLen"
+            }
             $nameBytes = $reader.ReadBytes($nameLen)
             $relativePath = [System.Text.Encoding]::UTF8.GetString($nameBytes)
             $fileSize = $reader.ReadInt64()
+            if ($fileSize -lt 0 -or $fileSize -gt 100GB) {
+                throw "Invalid file size: $fileSize"
+            }
 
-            $destPath = Join-Path $OutputFolder $relativePath
+            # Prevent path traversal — ensure destPath stays within OutputFolder
+            $destPath = [System.IO.Path]::GetFullPath((Join-Path $OutputFolder $relativePath))
+            $resolvedOutput = [System.IO.Path]::GetFullPath($OutputFolder)
+            if (-not $destPath.StartsWith($resolvedOutput)) {
+                Write-Log "Path traversal blocked: $relativePath" -Level 'ERROR'
+                $errors += "Blocked path traversal: $relativePath"
+                # Drain this file's bytes from the stream so we stay in sync
+                $remaining = $fileSize
+                while ($remaining -gt 0) {
+                    $toRead = [Math]::Min($remaining, $buffer.Length)
+                    $bytesRead = $stream.Read($buffer, 0, $toRead)
+                    if ($bytesRead -eq 0) { break }
+                    $remaining -= $bytesRead
+                }
+                continue
+            }
+
             $destDir = Split-Path -Parent $destPath
             if (-not (Test-Path $destDir)) {
                 New-Item -Path $destDir -ItemType Directory -Force | Out-Null
             }
 
+            $fileComplete = $false
             try {
                 $fileStream = [System.IO.File]::Create($destPath)
                 try {
@@ -519,13 +661,32 @@ function Start-DirectReceive {
                         $remaining -= $bytesRead
                         $receivedBytes += $bytesRead
                     }
+                    $fileComplete = $true
                 } finally {
                     $fileStream.Close()
+                    # Delete partial files on failure to prevent truncated data
+                    if (-not $fileComplete -and (Test-Path $destPath)) {
+                        Remove-Item $destPath -Force -ErrorAction SilentlyContinue
+                    }
                 }
                 $receivedFiles++
             } catch {
                 $errors += "Failed: $relativePath - $($_.Exception.Message)"
                 Write-Log "Error receiving $relativePath`: $($_.Exception.Message)" -Level 'WARN'
+                # Drain remaining bytes to keep stream protocol in sync
+                if ($remaining -gt 0) {
+                    try {
+                        while ($remaining -gt 0) {
+                            $toRead = [Math]::Min($remaining, $buffer.Length)
+                            $bytesRead = $stream.Read($buffer, 0, $toRead)
+                            if ($bytesRead -eq 0) { throw "Connection lost" }
+                            $remaining -= $bytesRead
+                        }
+                    } catch {
+                        Write-Log "Stream desynchronized — aborting transfer" -Level 'ERROR'
+                        break
+                    }
+                }
             }
 
             if ($OnProgress -and (($i + 1) % 5 -eq 0 -or $i -eq $fileCount - 1)) {

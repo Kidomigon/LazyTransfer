@@ -99,7 +99,7 @@ Write-Host "`nBuilding EXE..."
 $exePath = Join-Path $OutputPath "LazyTransfer.exe"
 
 # Create a merged script that includes all modules inline
-$mergedPath = Join-Path $env:TEMP "LazyTransfer-Merged.ps1"
+$mergedPath = [System.IO.Path]::GetTempFileName() -replace '\.tmp$', '.ps1'
 $mergedContent = New-Object System.Text.StringBuilder
 
 # Add module contents first

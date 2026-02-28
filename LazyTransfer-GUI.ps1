@@ -839,6 +839,8 @@ function Start-FilesMigration {
         } catch {
             Write-Log "ZIP compression failed, keeping uncompressed folder: $($_.Exception.Message)" -Level 'WARN'
             $errors += "ZIP failed: $($_.Exception.Message)"
+            # Clean up partial ZIP to avoid confusion and save disk space
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
         }
 
         if ($OnProgress) { & $OnProgress "Complete" $totalBytes $totalBytes $totalFolders $totalFolders "Done" }
@@ -1056,6 +1058,13 @@ function Install-ProgramsFromBundle {
     $bundle = Get-Content $BundleJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $bundle.Programs) { throw "Invalid bundle file." }
 
+    # Filter out null/empty display names to prevent parameter binding errors
+    $SelectedDisplayNames = @($SelectedDisplayNames | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) })
+    if ($SelectedDisplayNames.Count -eq 0) {
+        Write-Log "No valid programs selected for installation" -Level 'WARN'
+        return @()
+    }
+
     $wingetOk = Ensure-Winget -AutoInstall:$AutoInstallWinget
     Write-Log "Winget: $(if ($wingetOk) { 'Ready' } else { 'Not available' })"
     
@@ -1205,7 +1214,11 @@ function Import-BrowserBookmarks {
                 if (Test-Path $src) {
                     $destDir = Split-Path -Parent $dest
                     if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
-                    if (Test-Path $dest) { Copy-Item -Path $dest -Destination "${dest}.bak" -Force }
+                    if (Test-Path $dest) {
+                        $bakName = "${dest}.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                        if (-not (Test-Path "${dest}.bak")) { $bakName = "${dest}.bak" }
+                        Copy-Item -Path $dest -Destination $bakName -Force
+                    }
                     Copy-Item -Path $src -Destination $dest -Force
                     $results += [PSCustomObject]@{ Browser = $browser; Status = "Restored" }
                     Write-Log "$browser bookmarks restored" -Level 'SUCCESS'
@@ -1222,7 +1235,11 @@ function Import-BrowserBookmarks {
                             $places = Join-Path $ffSrc "places.sqlite"
                             if (Test-Path $places) {
                                 $destPlaces = Join-Path $profileDir.FullName "places.sqlite"
-                                if (Test-Path $destPlaces) { Copy-Item -Path $destPlaces -Destination "${destPlaces}.bak" -Force }
+                                if (Test-Path $destPlaces) {
+                                    $bakName = "${destPlaces}.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                                    if (-not (Test-Path "${destPlaces}.bak")) { $bakName = "${destPlaces}.bak" }
+                                    Copy-Item -Path $destPlaces -Destination $bakName -Force
+                                }
                                 Copy-Item -Path $places -Destination $profileDir.FullName -Force
                                 foreach ($ext in @('-wal', '-shm')) {
                                     $walFile = "${places}${ext}"
@@ -1265,80 +1282,105 @@ function Restore-FilesMigration {
         $tempExtract = Join-Path $env:TEMP "LazyTransfer-Restore-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         Write-Log "Extracting ZIP bundle..."
         if ($OnProgress) { & $OnProgress "Extracting" 0 0 0 0 "Extracting ZIP..." }
+        # Safe ZIP extraction — prevent ZIP slip
         Add-Type -AssemblyName System.IO.Compression.FileSystem
-        [System.IO.Compression.ZipFile]::ExtractToDirectory($BundlePath, $tempExtract)
+        $resolvedExtract = [System.IO.Path]::GetFullPath($tempExtract)
+        if (-not (Test-Path $resolvedExtract)) { New-Item -Path $resolvedExtract -ItemType Directory -Force | Out-Null }
+        $archive = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
+        try {
+            foreach ($entry in $archive.Entries) {
+                if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
+                $destPath = [System.IO.Path]::GetFullPath((Join-Path $tempExtract $entry.FullName))
+                if (-not $destPath.StartsWith($resolvedExtract)) {
+                    Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
+                    continue
+                }
+                if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
+                    if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
+                } else {
+                    $destDir = Split-Path -Parent $destPath
+                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
+                }
+            }
+        } finally {
+            $archive.Dispose()
+        }
         $sourcePath = $tempExtract
         Write-Log "Extracted to temp folder" -Level 'SUCCESS'
-    }
-
-    # Read manifest
-    $manifest = $null
-    $manifestPath = Join-Path $sourcePath "migration-manifest.json"
-    if (Test-Path $manifestPath) {
-        $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
     }
 
     $errors = @()
     $totalBytesRestored = [long]0
     $foldersRestored = 0
-    $totalSteps = $SelectedFolders.Count + $(if ($SelectedBrowsers.Count -gt 0) { 1 } else { 0 })
-    $currentStep = 0
-
-    # Restore each folder
-    foreach ($name in $SelectedFolders) {
-        if ($script:CancelRequested) { break }
-        $currentStep++
-        $srcPath = Join-Path $sourcePath $name
-        if (-not (Test-Path $srcPath)) {
-            Write-Log "Folder not found in bundle: $name" -Level 'WARN'
-            $errors += "Folder not in bundle: $name"
-            continue
-        }
-
-        $destPath = Get-UserFolderPath -FolderName $name
-        if (-not $destPath) {
-            $errors += "Unknown folder: $name"
-            continue
-        }
-
-        Write-Log "Restoring $name to $destPath..."
-        if ($OnProgress) { & $OnProgress $name 0 0 $currentStep $totalSteps "Restoring..." }
-
-        try {
-            # robocopy merge mode (no /PURGE)
-            $roboArgs = @($srcPath, $destPath, '/E', '/COPY:DAT', '/R:1', '/W:1', '/NP', '/MT:4', '/NFL', '/NDL')
-            $roboProcess = Start-Process -FilePath "robocopy" -ArgumentList $roboArgs -Wait -PassThru -WindowStyle Hidden
-            if ($roboProcess.ExitCode -le 7) {
-                $foldersRestored++
-                try {
-                    $measure = Get-ChildItem -Path $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
-                    if ($measure.Sum) { $totalBytesRestored += [long]$measure.Sum }
-                } catch { }
-                Write-Log "[OK] $name restored" -Level 'SUCCESS'
-            } else {
-                $errors += "Robocopy error for $name (exit $($roboProcess.ExitCode))"
-                Write-Log "[X] $name restore had errors" -Level 'ERROR'
-            }
-        } catch {
-            $errors += "Failed: $name - $($_.Exception.Message)"
-            Write-Log "[X] Failed to restore $name" -Level 'ERROR'
-        }
-        if ($OnProgress) { & $OnProgress $name $totalBytesRestored 0 $currentStep $totalSteps "Done" }
-        Update-GuiStatus
-    }
-
-    # Restore bookmarks
     $bookmarksRestored = @()
-    if ($SelectedBrowsers.Count -gt 0) {
-        $currentStep++
-        if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Restoring bookmarks..." }
-        $bookmarksRestored = Import-BrowserBookmarks -SourceFolder $sourcePath -Browsers $SelectedBrowsers
-        if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Done" }
-    }
 
-    # Cleanup temp extraction
-    if ($tempExtract -and (Test-Path $tempExtract)) {
-        try { Remove-Item $tempExtract -Recurse -Force } catch { }
+    try {
+        # Read manifest
+        $manifest = $null
+        $manifestPath = Join-Path $sourcePath "migration-manifest.json"
+        if (Test-Path $manifestPath) {
+            $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+
+        $totalSteps = $SelectedFolders.Count + $(if ($SelectedBrowsers.Count -gt 0) { 1 } else { 0 })
+        $currentStep = 0
+
+        # Restore each folder
+        foreach ($name in $SelectedFolders) {
+            if ($script:CancelRequested) { break }
+            $currentStep++
+            $srcPath = Join-Path $sourcePath $name
+            if (-not (Test-Path $srcPath)) {
+                Write-Log "Folder not found in bundle: $name" -Level 'WARN'
+                $errors += "Folder not in bundle: $name"
+                continue
+            }
+
+            $destPath = Get-UserFolderPath -FolderName $name
+            if (-not $destPath) {
+                $errors += "Unknown folder: $name"
+                continue
+            }
+
+            Write-Log "Restoring $name to $destPath..."
+            if ($OnProgress) { & $OnProgress $name 0 0 $currentStep $totalSteps "Restoring..." }
+
+            try {
+                # robocopy merge mode (no /PURGE)
+                $roboArgs = @($srcPath, $destPath, '/E', '/COPY:DAT', '/R:1', '/W:1', '/NP', '/MT:4', '/NFL', '/NDL')
+                $roboProcess = Start-Process -FilePath "robocopy" -ArgumentList $roboArgs -Wait -PassThru -WindowStyle Hidden
+                if ($roboProcess.ExitCode -le 7) {
+                    $foldersRestored++
+                    try {
+                        $measure = Get-ChildItem -Path $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                        if ($measure.Sum) { $totalBytesRestored += [long]$measure.Sum }
+                    } catch { }
+                    Write-Log "[OK] $name restored" -Level 'SUCCESS'
+                } else {
+                    $errors += "Robocopy error for $name (exit $($roboProcess.ExitCode))"
+                    Write-Log "[X] $name restore had errors" -Level 'ERROR'
+                }
+            } catch {
+                $errors += "Failed: $name - $($_.Exception.Message)"
+                Write-Log "[X] Failed to restore $name" -Level 'ERROR'
+            }
+            if ($OnProgress) { & $OnProgress $name $totalBytesRestored 0 $currentStep $totalSteps "Done" }
+            Update-GuiStatus
+        }
+
+        # Restore bookmarks
+        if ($SelectedBrowsers.Count -gt 0) {
+            $currentStep++
+            if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Restoring bookmarks..." }
+            $bookmarksRestored = Import-BrowserBookmarks -SourceFolder $sourcePath -Browsers $SelectedBrowsers
+            if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Done" }
+        }
+    } finally {
+        # Always cleanup temp extraction, even on error
+        if ($tempExtract -and (Test-Path $tempExtract)) {
+            try { Remove-Item $tempExtract -Recurse -Force } catch { }
+        }
     }
 
     return [PSCustomObject]@{

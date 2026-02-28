@@ -210,7 +210,8 @@ if (Test-Path $guiScript) {
         if ($startIdx -ge 0 -and $endIdx -gt $startIdx) {
             $regionCode = $content.Substring($startIdx, $endIdx + $endTag.Length - $startIdx)
             try {
-                [ScriptBlock]::Create($regionCode).Invoke()
+                # Use dot-sourcing (not .Invoke()) to define functions in the script scope
+                . ([ScriptBlock]::Create($regionCode))
             } catch {
                 Write-Host "Warning: Could not load region '$regionName': $($_.Exception.Message)" -ForegroundColor Yellow
             }
