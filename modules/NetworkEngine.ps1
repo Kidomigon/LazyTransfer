@@ -43,13 +43,15 @@ function Get-PrimaryLocalIP {
 
 function Test-PortAvailable {
     param([Parameter(Mandatory=$true)][int]$Port)
+    $listener = $null
     try {
         $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Loopback, $Port)
         $listener.Start()
-        $listener.Stop()
         return $true
     } catch {
         return $false
+    } finally {
+        if ($listener) { try { $listener.Stop() } catch { } }
     }
 }
 
@@ -87,6 +89,9 @@ function Remove-FirewallRule {
 $script:HttpListener = $null
 $script:HttpServerRunning = $false
 $script:HttpServerFolder = $null
+$script:HttpFirewallRuleName = $null
+$script:HttpServedFiles = $null
+$script:HttpLandingPageHtml = $null
 
 function Start-TransferServer {
     param(
@@ -101,8 +106,12 @@ function Start-TransferServer {
     $script:HttpServerFolder = $SourceFolder
     $script:HttpServerRunning = $true
 
-    $fwRuleName = "LazyTransfer-HTTP-$Port"
-    Add-FirewallRule -Name $fwRuleName -Port $Port | Out-Null
+    $script:HttpFirewallRuleName = "LazyTransfer-HTTP-$Port"
+    Add-FirewallRule -Name $script:HttpFirewallRuleName -Port $Port | Out-Null
+
+    # Cache file list and landing page HTML
+    $script:HttpServedFiles = Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue
+    $script:HttpLandingPageHtml = Get-TransferLandingPage -SourceFolder $SourceFolder -Port $Port
 
     $prefix = "http://+:$Port/"
     $script:HttpListener = New-Object System.Net.HttpListener
@@ -111,8 +120,9 @@ function Start-TransferServer {
     try {
         $script:HttpListener.Start()
     } catch {
-        Remove-FirewallRule -Name $fwRuleName | Out-Null
+        Remove-FirewallRule -Name $script:HttpFirewallRuleName | Out-Null
         $script:HttpServerRunning = $false
+        $script:HttpFirewallRuleName = $null
         throw "Failed to start HTTP listener: $($_.Exception.Message)"
     }
 
@@ -142,8 +152,8 @@ function Start-TransferServer {
             Write-Log "HTTP request: $($request.HttpMethod) $path"
 
             if ($path -eq '/' -or $path -eq '/index.html') {
-                # Landing page with file listing
-                $html = Get-TransferLandingPage -SourceFolder $SourceFolder -Port $Port
+                # Serve cached landing page
+                $html = if ($script:HttpLandingPageHtml) { $script:HttpLandingPageHtml } else { Get-TransferLandingPage -SourceFolder $SourceFolder -Port $Port }
                 $buffer = [System.Text.Encoding]::UTF8.GetBytes($html)
                 $response.ContentType = "text/html; charset=utf-8"
                 $response.ContentLength64 = $buffer.Length
@@ -279,8 +289,12 @@ function Stop-TransferServer {
         } catch { }
         $script:HttpListener = $null
     }
-    # Remove any firewall rules we created
-    Remove-FirewallRule -Name "LazyTransfer-HTTP-8642" | Out-Null
+    if ($script:HttpFirewallRuleName) {
+        Remove-FirewallRule -Name $script:HttpFirewallRuleName | Out-Null
+        $script:HttpFirewallRuleName = $null
+    }
+    $script:HttpServedFiles = $null
+    $script:HttpLandingPageHtml = $null
     Write-Log "HTTP Transfer Server stopped" -Level 'INFO'
 }
 

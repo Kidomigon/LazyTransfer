@@ -19,12 +19,6 @@ Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
 
-# Load modules
-$script:ModulesDir = Join-Path (if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }) "modules"
-if (Test-Path (Join-Path $script:ModulesDir "NetworkEngine.ps1")) {
-    . (Join-Path $script:ModulesDir "NetworkEngine.ps1")
-}
-
 #region Icon
 function Get-AppIcon {
     # Use Windows built-in icon (Application icon from shell32.dll index 2)
@@ -91,6 +85,12 @@ function Test-IsNoiseAppName {
 $script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if ([string]::IsNullOrWhiteSpace($script:ScriptDir)) { $script:ScriptDir = $PWD.Path }
 $script:SettingsFile = Join-Path $script:ScriptDir "settings.json"
+$script:ModulesDir = Join-Path $script:ScriptDir "modules"
+
+# Load modules
+if (Test-Path (Join-Path $script:ModulesDir "NetworkEngine.ps1")) {
+    . (Join-Path $script:ModulesDir "NetworkEngine.ps1")
+}
 
 $script:UserSettings = @{
     LastBundlePath = ""
@@ -481,47 +481,41 @@ function Export-BrowserBookmarks {
     $bookmarksDir = Join-Path $TargetFolder "Bookmarks"
     if (-not (Test-Path $bookmarksDir)) { New-Item -Path $bookmarksDir -ItemType Directory -Force | Out-Null }
 
+    $chromiumBrowsers = @{
+        'Chrome' = @{ Source = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"; BackupName = "Chrome_Bookmarks.json" }
+        'Edge'   = @{ Source = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"; BackupName = "Edge_Bookmarks.json" }
+    }
+
     foreach ($browser in $Browsers) {
         try {
-            switch ($browser) {
-                'Chrome' {
-                    $src = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $dest = Join-Path $bookmarksDir "Chrome_Bookmarks.json"
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $exported += "Chrome"
-                        Write-Log "Exported Chrome bookmarks"
-                    }
+            if ($chromiumBrowsers.ContainsKey($browser)) {
+                $info = $chromiumBrowsers[$browser]
+                if (Test-Path $info.Source) {
+                    $dest = Join-Path $bookmarksDir $info.BackupName
+                    Copy-Item -Path $info.Source -Destination $dest -Force
+                    $exported += $browser
+                    Write-Log "Exported $browser bookmarks"
                 }
-                'Firefox' {
-                    $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like '*.default*' } | Select-Object -First 1
-                    if ($profileDir) {
-                        $ffDir = Join-Path $bookmarksDir "Firefox"
-                        if (-not (Test-Path $ffDir)) { New-Item -Path $ffDir -ItemType Directory -Force | Out-Null }
-                        $places = Join-Path $profileDir.FullName "places.sqlite"
-                        if (Test-Path $places) {
-                            Copy-Item -Path $places -Destination $ffDir -Force
-                            # Copy WAL and SHM files for SQLite integrity
-                            foreach ($ext in @('-wal', '-shm')) {
-                                $walFile = "${places}${ext}"
-                                if (Test-Path $walFile) { Copy-Item -Path $walFile -Destination $ffDir -Force }
-                            }
+            }
+            elseif ($browser -eq 'Firefox') {
+                $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like '*.default*' } | Select-Object -First 1
+                if ($profileDir) {
+                    $ffDir = Join-Path $bookmarksDir "Firefox"
+                    if (-not (Test-Path $ffDir)) { New-Item -Path $ffDir -ItemType Directory -Force | Out-Null }
+                    $places = Join-Path $profileDir.FullName "places.sqlite"
+                    if (Test-Path $places) {
+                        Copy-Item -Path $places -Destination $ffDir -Force
+                        # Copy WAL and SHM files for SQLite integrity
+                        foreach ($ext in @('-wal', '-shm')) {
+                            $walFile = "${places}${ext}"
+                            if (Test-Path $walFile) { Copy-Item -Path $walFile -Destination $ffDir -Force }
                         }
-                        $backups = Join-Path $profileDir.FullName "bookmarkbackups"
-                        if (Test-Path $backups) { Copy-Item -Path $backups -Destination $ffDir -Recurse -Force }
-                        $exported += "Firefox"
-                        Write-Log "Exported Firefox bookmarks"
                     }
-                }
-                'Edge' {
-                    $src = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $dest = Join-Path $bookmarksDir "Edge_Bookmarks.json"
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $exported += "Edge"
-                        Write-Log "Exported Edge bookmarks"
-                    }
+                    $backups = Join-Path $profileDir.FullName "bookmarkbackups"
+                    if (Test-Path $backups) { Copy-Item -Path $backups -Destination $ffDir -Recurse -Force }
+                    $exported += "Firefox"
+                    Write-Log "Exported Firefox bookmarks"
                 }
             }
         } catch {
@@ -1199,36 +1193,27 @@ function Import-BrowserBookmarks {
                 continue
             }
 
-            switch ($browser) {
-                'Chrome' {
-                    $src = Join-Path $bookmarksDir "Chrome_Bookmarks.json"
-                    $dest = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $destDir = Split-Path -Parent $dest
-                        if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
-                        if (Test-Path $dest) { Copy-Item -Path $dest -Destination "${dest}.bak" -Force }
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $results += [PSCustomObject]@{ Browser = "Chrome"; Status = "Restored" }
-                        Write-Log "Chrome bookmarks restored" -Level 'SUCCESS'
-                    } else {
-                        $results += [PSCustomObject]@{ Browser = "Chrome"; Status = "No backup found" }
-                    }
+            $chromiumBrowsers = @{
+                'Chrome' = @{ BackupName = "Chrome_Bookmarks.json"; Dest = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks" }
+                'Edge'   = @{ BackupName = "Edge_Bookmarks.json"; Dest = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks" }
+            }
+
+            if ($chromiumBrowsers.ContainsKey($browser)) {
+                $info = $chromiumBrowsers[$browser]
+                $src = Join-Path $bookmarksDir $info.BackupName
+                $dest = $info.Dest
+                if (Test-Path $src) {
+                    $destDir = Split-Path -Parent $dest
+                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+                    if (Test-Path $dest) { Copy-Item -Path $dest -Destination "${dest}.bak" -Force }
+                    Copy-Item -Path $src -Destination $dest -Force
+                    $results += [PSCustomObject]@{ Browser = $browser; Status = "Restored" }
+                    Write-Log "$browser bookmarks restored" -Level 'SUCCESS'
+                } else {
+                    $results += [PSCustomObject]@{ Browser = $browser; Status = "No backup found" }
                 }
-                'Edge' {
-                    $src = Join-Path $bookmarksDir "Edge_Bookmarks.json"
-                    $dest = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $destDir = Split-Path -Parent $dest
-                        if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
-                        if (Test-Path $dest) { Copy-Item -Path $dest -Destination "${dest}.bak" -Force }
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $results += [PSCustomObject]@{ Browser = "Edge"; Status = "Restored" }
-                        Write-Log "Edge bookmarks restored" -Level 'SUCCESS'
-                    } else {
-                        $results += [PSCustomObject]@{ Browser = "Edge"; Status = "No backup found" }
-                    }
-                }
-                'Firefox' {
+            }
+            elseif ($browser -eq 'Firefox') {
                     $ffSrc = Join-Path $bookmarksDir "Firefox"
                     if (Test-Path $ffSrc) {
                         $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
@@ -1429,24 +1414,9 @@ function Find-BundleContents {
         $scanPath = if ($filesSource) { $filesSource.FullName } else { $null }
         $folders = @()
         $totalSize = [long]0
+        $manifest = $null
 
-        if ($scanPath) {
-            $folderNames = @('Documents', 'Downloads', 'Pictures', 'Videos', 'Music', 'Desktop')
-            foreach ($fn in $folderNames) {
-                $fp = Join-Path $scanPath $fn
-                if (Test-Path $fp) {
-                    $size = 0
-                    try {
-                        $measure = Get-ChildItem -Path $fp -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
-                        if ($measure.Sum) { $size = [long]$measure.Sum }
-                    } catch { }
-                    $folders += [PSCustomObject]@{ Name = $fn; SizeBytes = $size }
-                    $totalSize += $size
-                }
-            }
-        }
-
-        # Read manifest for metadata
+        # Read manifest first — use stored sizes when available
         if ($scanPath) {
             $mf = Join-Path $scanPath "migration-manifest.json"
             if (Test-Path $mf) {
@@ -1459,7 +1429,35 @@ function Find-BundleContents {
                             ToolVersion = if ($manifest.ToolVersion) { $manifest.ToolVersion } else { "" }
                         }
                     }
-                } catch { }
+                } catch { $manifest = $null }
+            }
+        }
+
+        # Build folder list: prefer manifest sizes, fall back to recursive scan
+        if ($scanPath) {
+            $manifestSizes = @{}
+            if ($manifest -and $manifest.Folders) {
+                foreach ($mfFolder in $manifest.Folders) {
+                    if ($mfFolder.Name -and $mfFolder.SizeBytes) { $manifestSizes[$mfFolder.Name] = [long]$mfFolder.SizeBytes }
+                }
+            }
+
+            $folderNames = @('Documents', 'Downloads', 'Pictures', 'Videos', 'Music', 'Desktop')
+            foreach ($fn in $folderNames) {
+                $fp = Join-Path $scanPath $fn
+                if (Test-Path $fp) {
+                    if ($manifestSizes.ContainsKey($fn)) {
+                        $size = $manifestSizes[$fn]
+                    } else {
+                        $size = 0
+                        try {
+                            $measure = Get-ChildItem -Path $fp -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                            if ($measure.Sum) { $size = [long]$measure.Sum }
+                        } catch { }
+                    }
+                    $folders += [PSCustomObject]@{ Name = $fn; SizeBytes = $size }
+                    $totalSize += $size
+                }
             }
         }
 
@@ -1640,9 +1638,18 @@ function Set-ActiveSidebarButton {
     }
 }
 
+function Clear-ContentPanel {
+    if ($script:ContentPanel) {
+        foreach ($ctrl in @($script:ContentPanel.Controls)) {
+            try { $ctrl.Dispose() } catch { }
+        }
+        $script:ContentPanel.Controls.Clear()
+    }
+}
+
 function Show-ScanPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Scan"
     Update-StatusBar "Ready to scan"
     
@@ -1745,7 +1752,7 @@ function Show-ScanPage {
 
 function Show-InstallPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Install"
     Update-StatusBar "Ready to install"
     
@@ -2231,7 +2238,7 @@ function Show-InstallPage {
 
 function Show-FilesPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Files"
     Update-StatusBar "Ready for files migration"
 
@@ -2644,7 +2651,7 @@ function Show-FilesPage {
 
 function Show-TransferPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Transfer"
     Update-StatusBar "Remote Transfer"
 
@@ -3105,7 +3112,7 @@ function Show-TransferPage {
 
 function Show-RestorePage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Restore"
     Update-StatusBar "Restore Bundle"
 
@@ -3489,7 +3496,7 @@ function Show-RestorePage {
 
 function Show-SettingsPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Settings"
     Update-StatusBar "Settings - Coming Soon"
     

@@ -189,32 +189,31 @@ if (Test-Path (Join-Path $modulesDir "NetworkEngine.ps1")) {
     . (Join-Path $modulesDir "NetworkEngine.ps1")
 }
 
-# Source the essential engine functions from the GUI script
-# We need: Get-InstalledPrograms, Build-ScanBundle, Start-FilesMigration, Install-ProgramsFromBundle,
-#           Get-UserFolderPath, Test-BrowserInstalled, Export-BrowserBookmarks, Find-BundleContents,
-#           Restore-FilesMigration, Import-BrowserBookmarks, Start-FullRestore, etc.
-# These are all defined before #region GUI in the main script.
-
-# Extract engine functions from GUI script (everything before #region GUI)
+# Extract engine regions from GUI script by matching #region/#endregion pairs.
+# This avoids loading the entire GUI and is resilient to region ordering.
 $guiScript = Join-Path $script:ScriptDir "LazyTransfer-GUI.ps1"
 if (Test-Path $guiScript) {
     $content = Get-Content $guiScript -Raw -Encoding UTF8
-    # Find the position of #region GUI and take everything before it
-    $guiRegionIndex = $content.IndexOf('#region GUI')
-    if ($guiRegionIndex -gt 0) {
-        $engineCode = $content.Substring(0, $guiRegionIndex)
-        # Remove the assembly loading lines and icon function (we handle those ourselves)
-        $engineCode = $engineCode -replace '(?ms)^Add-Type -AssemblyName.*$', ''
-        $engineCode = $engineCode -replace '(?ms)#region Icon.*?#endregion Icon', ''
-        $engineCode = $engineCode -replace '(?ms)#region Global Settings.*?#endregion Global Settings', ''
-        $engineCode = $engineCode -replace '(?ms)#region User Settings.*?#endregion User Settings', ''
-        $engineCode = $engineCode -replace '(?ms)#region Theme Colors.*?#endregion Theme Colors', ''
-        $engineCode = $engineCode -replace '(?ms)#region Logging.*?#endregion Logging', ''
-        $engineCode = $engineCode -replace '(?ms)#region Helpers.*?#endregion Helpers', ''
-        try {
-            [ScriptBlock]::Create($engineCode).Invoke()
-        } catch {
-            Write-Host "Warning: Could not load some engine functions: $($_.Exception.Message)" -ForegroundColor Yellow
+    $engineRegions = @(
+        'App Categories',
+        'Files Migration Helpers',
+        'Program Inventory',
+        'Files Migration Engine',
+        'Install Engine',
+        'Restore Engine'
+    )
+    foreach ($regionName in $engineRegions) {
+        $startTag = "#region $regionName"
+        $endTag = "#endregion $regionName"
+        $startIdx = $content.IndexOf($startTag)
+        $endIdx = $content.IndexOf($endTag)
+        if ($startIdx -ge 0 -and $endIdx -gt $startIdx) {
+            $regionCode = $content.Substring($startIdx, $endIdx + $endTag.Length - $startIdx)
+            try {
+                [ScriptBlock]::Create($regionCode).Invoke()
+            } catch {
+                Write-Host "Warning: Could not load region '$regionName': $($_.Exception.Message)" -ForegroundColor Yellow
+            }
         }
     }
 }
