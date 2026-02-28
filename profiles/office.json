@@ -1,0 +1,10 @@
+{
+    "name": "Office",
+    "description": "Productivity and office essentials",
+    "version": "2.5",
+    "categories": ["Office", "Browsers", "Communication", "Cloud"],
+    "programs": true,
+    "files": ["Documents", "Desktop", "Downloads", "Pictures"],
+    "system": [],
+    "bookmarks": ["Chrome", "Edge"]
+}

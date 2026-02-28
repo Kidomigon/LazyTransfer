@@ -1,0 +1,10 @@
+{
+    "name": "Gamer",
+    "description": "Gaming platforms and media tools",
+    "version": "2.5",
+    "categories": ["Gaming", "Communication", "Media"],
+    "programs": true,
+    "files": ["Documents", "Pictures", "Videos", "Desktop"],
+    "system": [],
+    "bookmarks": ["Chrome"]
+}

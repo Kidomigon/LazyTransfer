@@ -1,0 +1,10 @@
+{
+    "name": "Developer",
+    "description": "Essential tools for software developers",
+    "version": "2.5",
+    "categories": ["DevTools", "Browsers", "Utilities"],
+    "programs": true,
+    "files": ["Documents", "Desktop"],
+    "system": ["SSH", "Git", "Environment Variables"],
+    "bookmarks": ["Chrome", "Firefox"]
+}

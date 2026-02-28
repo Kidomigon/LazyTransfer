@@ -1,0 +1,10 @@
+{
+    "name": "Everything",
+    "description": "Full migration — all programs, files, and settings",
+    "version": "2.5",
+    "categories": ["*"],
+    "programs": true,
+    "files": ["Documents", "Downloads", "Pictures", "Videos", "Music", "Desktop"],
+    "system": ["WiFi", "SSH", "Git", "Environment Variables"],
+    "bookmarks": ["Chrome", "Firefox", "Edge"]
+}
