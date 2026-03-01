@@ -408,6 +408,41 @@ function Update-GuiStatus {
 #endregion Helpers
 
 #region Files Migration Helpers
+
+function Expand-ZipSafe {
+    <#
+    .SYNOPSIS
+        Extract a ZIP archive with path traversal (ZIP slip) protection.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ZipPath,
+        [Parameter(Mandatory=$true)][string]$DestinationFolder
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $resolvedDest = [System.IO.Path]::GetFullPath($DestinationFolder)
+    if (-not (Test-Path $resolvedDest)) { New-Item -Path $resolvedDest -ItemType Directory -Force | Out-Null }
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
+            $entryDest = [System.IO.Path]::GetFullPath((Join-Path $DestinationFolder $entry.FullName))
+            if (-not $entryDest.StartsWith($resolvedDest)) {
+                Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
+                continue
+            }
+            if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
+                if (-not (Test-Path $entryDest)) { New-Item -Path $entryDest -ItemType Directory -Force | Out-Null }
+            } else {
+                $entryDir = Split-Path -Parent $entryDest
+                if (-not (Test-Path $entryDir)) { New-Item -Path $entryDir -ItemType Directory -Force | Out-Null }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $entryDest, $true)
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 function Format-FileSize {
     param([Parameter(Mandatory=$true)][long]$Bytes)
     if ($Bytes -ge 1TB) { return "$([Math]::Round($Bytes / 1TB, 1)) TB" }
@@ -440,9 +475,9 @@ function Get-FolderSizes {
         $path = Get-UserFolderPath -FolderName $name
         $sizeBytes = 0
         $fileCount = 0
-        if ($path -and (Test-Path $path)) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
             try {
-                $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                $measure = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                 if ($measure.Sum) { $sizeBytes = $measure.Sum }
                 $fileCount = $measure.Count
             } catch { }
@@ -477,7 +512,7 @@ function Export-BrowserBookmarks {
         [Parameter(Mandatory=$true)][string]$TargetFolder,
         [Parameter(Mandatory=$true)][string[]]$Browsers
     )
-    $exported = @()
+    $exported = [System.Collections.Generic.List[string]]::new()
     $bookmarksDir = Join-Path $TargetFolder "Bookmarks"
     if (-not (Test-Path $bookmarksDir)) { New-Item -Path $bookmarksDir -ItemType Directory -Force | Out-Null }
 
@@ -493,7 +528,7 @@ function Export-BrowserBookmarks {
                 if (Test-Path $info.Source) {
                     $dest = Join-Path $bookmarksDir $info.BackupName
                     Copy-Item -Path $info.Source -Destination $dest -Force
-                    $exported += $browser
+                    $exported.Add($browser)
                     Write-Log "Exported $browser bookmarks"
                 }
             }
@@ -514,7 +549,7 @@ function Export-BrowserBookmarks {
                     }
                     $backups = Join-Path $profileDir.FullName "bookmarkbackups"
                     if (Test-Path $backups) { Copy-Item -Path $backups -Destination $ffDir -Recurse -Force }
-                    $exported += "Firefox"
+                    $exported.Add("Firefox")
                     Write-Log "Exported Firefox bookmarks"
                 }
             }
@@ -534,10 +569,14 @@ function Get-InstalledPrograms {
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
 
-    $rawItems = @()
+    $rawItems = [System.Collections.Generic.List[object]]::new()
     foreach ($root in $uninstallRoots) {
         if (Test-Path $root) {
-            try { $rawItems += Get-ItemProperty $root -ErrorAction SilentlyContinue } catch { }
+            try {
+                foreach ($item in (Get-ItemProperty $root -ErrorAction SilentlyContinue)) {
+                    $rawItems.Add($item)
+                }
+            } catch { }
         }
     }
 
@@ -699,6 +738,7 @@ function Start-FilesMigration {
     # Use pre-computed sizes if available, otherwise calculate
     $totalBytes = [long]0
     $folderSizes = @{}
+    $folderFileCounts = @{}
     if ($PrecomputedSizes) {
         foreach ($name in $SelectedFolders) {
             $size = if ($PrecomputedSizes.ContainsKey($name)) { [long]$PrecomputedSizes[$name] } else { 0 }
@@ -709,11 +749,12 @@ function Start-FilesMigration {
     } else {
         foreach ($name in $SelectedFolders) {
             $path = Get-UserFolderPath -FolderName $name
-            if ($path -and (Test-Path $path)) {
+            if ($path -and (Test-Path -LiteralPath $path)) {
                 try {
-                    $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $measure = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                     $size = if ($measure.Sum) { [long]$measure.Sum } else { 0 }
                     $folderSizes[$name] = $size
+                    $folderFileCounts[$name] = $measure.Count
                     $totalBytes += $size
                 } catch { $folderSizes[$name] = 0 }
             } else { $folderSizes[$name] = 0 }
@@ -736,7 +777,7 @@ function Start-FilesMigration {
         catch { }
     }
 
-    $errors = @()
+    $errors = [System.Collections.Generic.List[string]]::new()
     $copiedBytes = [long]0
     $copiedFiles = 0
     $totalFolders = $SelectedFolders.Count + $(if ($SelectedBrowsers.Count -gt 0) { 1 } else { 0 })
@@ -746,14 +787,14 @@ function Start-FilesMigration {
     foreach ($name in $SelectedFolders) {
         if ($script:CancelRequested) {
             Write-Log "File migration cancelled by user" -Level 'WARN'
-            $errors += "Cancelled by user"
+            $errors.Add("Cancelled by user")
             break
         }
         $currentFolder++
         $srcPath = Get-UserFolderPath -FolderName $name
         if (-not $srcPath -or -not (Test-Path $srcPath)) {
             Write-Log "Skipping $name - folder not found" -Level 'WARN'
-            $errors += "Folder not found: $name"
+            $errors.Add("Folder not found: $name")
             continue
         }
 
@@ -768,24 +809,29 @@ function Start-FilesMigration {
             # Robocopy exit codes 0-7 indicate success (various levels of files copied/skipped)
             if ($roboProcess.ExitCode -le 7) {
                 $copiedBytes += $folderSizes[$name]
-                try {
-                    $destMeasure = Get-ChildItem -Path $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object
-                    $copiedFiles += $destMeasure.Count
-                } catch { }
+                # Use pre-computed file count when available, avoids re-scanning
+                if ($folderFileCounts.ContainsKey($name)) {
+                    $copiedFiles += $folderFileCounts[$name]
+                } else {
+                    try {
+                        $srcMeasure = Get-ChildItem -LiteralPath $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object
+                        $copiedFiles += $srcMeasure.Count
+                    } catch { }
+                }
                 Write-Log "[OK] $name copied successfully" -Level 'SUCCESS'
             } else {
                 Write-Log "[X] $name copy had errors (robocopy exit: $($roboProcess.ExitCode))" -Level 'ERROR'
-                $errors += "Robocopy error for $name (exit code $($roboProcess.ExitCode))"
+                $errors.Add("Robocopy error for $name (exit code $($roboProcess.ExitCode))")
                 # Count only actually copied bytes for accurate progress
                 try {
-                    $partialMeasure = Get-ChildItem -Path $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $partialMeasure = Get-ChildItem -LiteralPath $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                     $copiedBytes += if ($partialMeasure.Sum) { [long]$partialMeasure.Sum } else { 0 }
                     $copiedFiles += $partialMeasure.Count
                 } catch { }
             }
         } catch {
             Write-Log "[X] Failed to copy $name`: $($_.Exception.Message)" -Level 'ERROR'
-            $errors += "Failed: $name - $($_.Exception.Message)"
+            $errors.Add("Failed: $name - $($_.Exception.Message)")
         }
 
         if ($OnProgress) { & $OnProgress $name $copiedBytes $totalBytes $currentFolder $totalFolders "Done" }
@@ -838,7 +884,7 @@ function Start-FilesMigration {
             Write-Log "[OK] ZIP archive created: $zipPath" -Level 'SUCCESS'
         } catch {
             Write-Log "ZIP compression failed, keeping uncompressed folder: $($_.Exception.Message)" -Level 'WARN'
-            $errors += "ZIP failed: $($_.Exception.Message)"
+            $errors.Add("ZIP failed: $($_.Exception.Message)")
             # Clean up partial ZIP to avoid confusion and save disk space
             if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
         }
@@ -925,13 +971,13 @@ function Search-WingetPackage {
         
         $lines = $output -split "`n" | Where-Object { $_ -match '\S' }
         $dataStarted = $false
-        $results = @()
-        
+        $results = [System.Collections.Generic.List[object]]::new()
+
         foreach ($line in $lines) {
             if ($line -match '^-+') { $dataStarted = $true; continue }
             if (-not $dataStarted) { continue }
             if ($line -match '^(.+?)\s{2,}(\S+\.\S+)\s') {
-                $results += [PSCustomObject]@{ Name = $matches[1].Trim(); Id = $matches[2].Trim() }
+                $results.Add([PSCustomObject]@{ Name = $matches[1].Trim(); Id = $matches[2].Trim() })
             }
         }
         
@@ -1074,10 +1120,10 @@ function Install-ProgramsFromBundle {
     # Reset the installed programs cache so verification reads fresh data
     Reset-InstalledProgramsCache
 
-    $results = @()
-    $manualQueue = @()
-    $failedQueue = @()
-    $stillMissing = @()
+    $results = [System.Collections.Generic.List[object]]::new()
+    $manualQueue = [System.Collections.Generic.List[string]]::new()
+    $failedQueue = [System.Collections.Generic.List[string]]::new()
+    $stillMissing = [System.Collections.Generic.List[string]]::new()
     
     $total = $SelectedDisplayNames.Count
     $current = 0
@@ -1091,7 +1137,7 @@ function Install-ProgramsFromBundle {
         if ($OnProgress) { & $OnProgress $name $current $total "Processing..." }
 
         if (Test-IsNoiseAppName -DisplayName $name) {
-            $results += [PSCustomObject]@{ DisplayName=$name; Status="Skipped"; Method="Noise"; Verified=$false }
+            $results.Add([PSCustomObject]@{ DisplayName=$name; Status="Skipped"; Method="Noise"; Verified=$false })
             continue
         }
 
@@ -1117,7 +1163,7 @@ function Install-ProgramsFromBundle {
                     Start-Sleep -Milliseconds 500
                     Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
-                    if (-not $verified) { $stillMissing += $name }
+                    if (-not $verified) { $stillMissing.Add($name) }
                 }
             }
 
@@ -1133,34 +1179,34 @@ function Install-ProgramsFromBundle {
                     Start-Sleep -Milliseconds 500
                     Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
-                    if (-not $verified) { $stillMissing += $name }
+                    if (-not $verified) { $stillMissing.Add($name) }
                 }
             }
 
             if (-not $installed) {
                 if ($target.WingetId -or $target.ChocoId) {
                     $status = "Failed"
-                    $failedQueue += $name
+                    $failedQueue.Add($name)
                 } else {
                     $status = "Manual"
                     $method = "Not Found"
-                    $manualQueue += $name
-                    $stillMissing += $name
+                    $manualQueue.Add($name)
+                    $stillMissing.Add($name)
                 }
             }
         } catch {
             $status = "Failed"
-            $failedQueue += $name
+            $failedQueue.Add($name)
             Write-Log "Error: $name - $($_.Exception.Message)"
         }
 
-        $results += [PSCustomObject]@{
+        $results.Add([PSCustomObject]@{
             DisplayName = $name
             Status = $status
             Method = $method
             Verified = $verified
-        }
-        
+        })
+
         if ($OnProgress) { & $OnProgress $name $current $total $status }
         Update-GuiStatus
     }
@@ -1187,7 +1233,7 @@ function Import-BrowserBookmarks {
         [Parameter(Mandatory=$true)][string]$SourceFolder,
         [string[]]$Browsers = @('Chrome', 'Firefox', 'Edge')
     )
-    $results = @()
+    $results = [System.Collections.Generic.List[object]]::new()
     $bookmarksDir = Join-Path $SourceFolder "Bookmarks"
     if (-not (Test-Path $bookmarksDir)) {
         Write-Log "No Bookmarks subfolder found in source" -Level 'WARN'
@@ -1198,7 +1244,7 @@ function Import-BrowserBookmarks {
         try {
             if (-not (Test-BrowserInstalled -BrowserName $browser)) {
                 Write-Log "$browser not installed, skipping bookmark restore" -Level 'WARN'
-                $results += [PSCustomObject]@{ Browser = $browser; Status = "Skipped - not installed" }
+                $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Skipped - not installed" })
                 continue
             }
 
@@ -1220,10 +1266,10 @@ function Import-BrowserBookmarks {
                         Copy-Item -Path $dest -Destination $bakName -Force
                     }
                     Copy-Item -Path $src -Destination $dest -Force
-                    $results += [PSCustomObject]@{ Browser = $browser; Status = "Restored" }
+                    $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Restored" })
                     Write-Log "$browser bookmarks restored" -Level 'SUCCESS'
                 } else {
-                    $results += [PSCustomObject]@{ Browser = $browser; Status = "No backup found" }
+                    $results.Add([PSCustomObject]@{ Browser = $browser; Status = "No backup found" })
                 }
             }
             elseif ($browser -eq 'Firefox') {
@@ -1248,19 +1294,19 @@ function Import-BrowserBookmarks {
                             }
                             $backups = Join-Path $ffSrc "bookmarkbackups"
                             if (Test-Path $backups) { Copy-Item -Path $backups -Destination $profileDir.FullName -Recurse -Force }
-                            $results += [PSCustomObject]@{ Browser = "Firefox"; Status = "Restored" }
+                            $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "Restored" })
                             Write-Log "Firefox bookmarks restored" -Level 'SUCCESS'
                         } else {
-                            $results += [PSCustomObject]@{ Browser = "Firefox"; Status = "No profile found" }
+                            $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "No profile found" })
                         }
                     } else {
-                        $results += [PSCustomObject]@{ Browser = "Firefox"; Status = "No backup found" }
+                        $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "No backup found" })
                     }
                 }
             }
         } catch {
             Write-Log "Failed to restore $browser bookmarks: $($_.Exception.Message)" -Level 'ERROR'
-            $results += [PSCustomObject]@{ Browser = $browser; Status = "Error: $($_.Exception.Message)" }
+            $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Error: $($_.Exception.Message)" })
         }
     }
     return $results
@@ -1282,35 +1328,12 @@ function Restore-FilesMigration {
         $tempExtract = Join-Path $env:TEMP "LazyTransfer-Restore-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
         Write-Log "Extracting ZIP bundle..."
         if ($OnProgress) { & $OnProgress "Extracting" 0 0 0 0 "Extracting ZIP..." }
-        # Safe ZIP extraction — prevent ZIP slip
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $resolvedExtract = [System.IO.Path]::GetFullPath($tempExtract)
-        if (-not (Test-Path $resolvedExtract)) { New-Item -Path $resolvedExtract -ItemType Directory -Force | Out-Null }
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($BundlePath)
-        try {
-            foreach ($entry in $archive.Entries) {
-                if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
-                $destPath = [System.IO.Path]::GetFullPath((Join-Path $tempExtract $entry.FullName))
-                if (-not $destPath.StartsWith($resolvedExtract)) {
-                    Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
-                    continue
-                }
-                if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
-                    if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
-                } else {
-                    $destDir = Split-Path -Parent $destPath
-                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
-                }
-            }
-        } finally {
-            $archive.Dispose()
-        }
+        Expand-ZipSafe -ZipPath $BundlePath -DestinationFolder $tempExtract
         $sourcePath = $tempExtract
         Write-Log "Extracted to temp folder" -Level 'SUCCESS'
     }
 
-    $errors = @()
+    $errors = [System.Collections.Generic.List[string]]::new()
     $totalBytesRestored = [long]0
     $foldersRestored = 0
     $bookmarksRestored = @()
@@ -1333,13 +1356,13 @@ function Restore-FilesMigration {
             $srcPath = Join-Path $sourcePath $name
             if (-not (Test-Path $srcPath)) {
                 Write-Log "Folder not found in bundle: $name" -Level 'WARN'
-                $errors += "Folder not in bundle: $name"
+                $errors.Add("Folder not in bundle: $name")
                 continue
             }
 
             $destPath = Get-UserFolderPath -FolderName $name
             if (-not $destPath) {
-                $errors += "Unknown folder: $name"
+                $errors.Add("Unknown folder: $name")
                 continue
             }
 
@@ -1353,16 +1376,16 @@ function Restore-FilesMigration {
                 if ($roboProcess.ExitCode -le 7) {
                     $foldersRestored++
                     try {
-                        $measure = Get-ChildItem -Path $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                        $measure = Get-ChildItem -LiteralPath $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                         if ($measure.Sum) { $totalBytesRestored += [long]$measure.Sum }
                     } catch { }
                     Write-Log "[OK] $name restored" -Level 'SUCCESS'
                 } else {
-                    $errors += "Robocopy error for $name (exit $($roboProcess.ExitCode))"
+                    $errors.Add("Robocopy error for $name (exit $($roboProcess.ExitCode))")
                     Write-Log "[X] $name restore had errors" -Level 'ERROR'
                 }
             } catch {
-                $errors += "Failed: $name - $($_.Exception.Message)"
+                $errors.Add("Failed: $name - $($_.Exception.Message)")
                 Write-Log "[X] Failed to restore $name" -Level 'ERROR'
             }
             if ($OnProgress) { & $OnProgress $name $totalBytesRestored 0 $currentStep $totalSteps "Done" }
@@ -1454,7 +1477,7 @@ function Find-BundleContents {
 
     if ($filesSource -or $filesZips) {
         $scanPath = if ($filesSource) { $filesSource.FullName } else { $null }
-        $folders = @()
+        $folders = [System.Collections.Generic.List[object]]::new()
         $totalSize = [long]0
         $manifest = $null
 
@@ -1493,11 +1516,11 @@ function Find-BundleContents {
                     } else {
                         $size = 0
                         try {
-                            $measure = Get-ChildItem -Path $fp -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                            $measure = Get-ChildItem -LiteralPath $fp -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                             if ($measure.Sum) { $size = [long]$measure.Sum }
                         } catch { }
                     }
-                    $folders += [PSCustomObject]@{ Name = $fn; SizeBytes = $size }
+                    $folders.Add([PSCustomObject]@{ Name = $fn; SizeBytes = $size })
                     $totalSize += $size
                 }
             }
@@ -1518,10 +1541,10 @@ function Find-BundleContents {
         $bookmarksDir = Join-Path $filesSource.FullName "Bookmarks"
     }
     if (Test-Path $bookmarksDir) {
-        $browsers = @()
-        if (Test-Path (Join-Path $bookmarksDir "Chrome_Bookmarks.json")) { $browsers += "Chrome" }
-        if (Test-Path (Join-Path $bookmarksDir "Edge_Bookmarks.json")) { $browsers += "Edge" }
-        if (Test-Path (Join-Path $bookmarksDir "Firefox")) { $browsers += "Firefox" }
+        $browsers = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path (Join-Path $bookmarksDir "Chrome_Bookmarks.json")) { $browsers.Add("Chrome") }
+        if (Test-Path (Join-Path $bookmarksDir "Edge_Bookmarks.json")) { $browsers.Add("Edge") }
+        if (Test-Path (Join-Path $bookmarksDir "Firefox")) { $browsers.Add("Firefox") }
         $result.Bookmarks = [PSCustomObject]@{
             Found    = $true
             Path     = $bookmarksDir

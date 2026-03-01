@@ -10,7 +10,7 @@
 #region Network Helpers
 
 function Get-LocalIPAddresses {
-    $ips = @()
+    $ips = [System.Collections.Generic.List[object]]::new()
     try {
         $adapters = [System.Net.NetworkInformation.NetworkInterface]::GetAllNetworkInterfaces() |
             Where-Object { $_.OperationalStatus -eq 'Up' -and $_.NetworkInterfaceType -ne 'Loopback' }
@@ -18,11 +18,11 @@ function Get-LocalIPAddresses {
             $props = $adapter.GetIPProperties()
             foreach ($addr in $props.UnicastAddresses) {
                 if ($addr.Address.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork) {
-                    $ips += [PSCustomObject]@{
+                    $ips.Add([PSCustomObject]@{
                         IP        = $addr.Address.ToString()
                         Interface = $adapter.Name
                         Type      = $adapter.NetworkInterfaceType.ToString()
-                    }
+                    })
                 }
             }
         }
@@ -203,7 +203,8 @@ function Start-TransferServer {
                         Add-Type -AssemblyName System.IO.Compression
 
                         $archive = New-Object System.IO.Compression.ZipArchive($response.OutputStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
-                        $files = Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue
+                        # Reuse cached file list instead of re-scanning the directory
+                        $files = if ($script:HttpServedFiles) { $script:HttpServedFiles } else { Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue }
                         $totalFiles = $files.Count
                         $currentFile = 0
 
@@ -359,29 +360,7 @@ function Get-TransferFromServer {
         $extractFolder = Join-Path $OutputFolder "LazyTransfer-Bundle"
         if (Test-Path $extractFolder) { Remove-Item $extractFolder -Recurse -Force }
 
-        # Safe ZIP extraction — prevent ZIP slip (path traversal in archive entries)
-        Add-Type -AssemblyName System.IO.Compression.FileSystem
-        $resolvedExtract = [System.IO.Path]::GetFullPath($extractFolder)
-        $archive = [System.IO.Compression.ZipFile]::OpenRead($zipPath)
-        try {
-            foreach ($entry in $archive.Entries) {
-                if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
-                $destPath = [System.IO.Path]::GetFullPath((Join-Path $extractFolder $entry.FullName))
-                if (-not $destPath.StartsWith($resolvedExtract)) {
-                    Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
-                    continue
-                }
-                if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
-                    if (-not (Test-Path $destPath)) { New-Item -Path $destPath -ItemType Directory -Force | Out-Null }
-                } else {
-                    $destDir = Split-Path -Parent $destPath
-                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
-                    [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $destPath, $true)
-                }
-            }
-        } finally {
-            $archive.Dispose()
-        }
+        Expand-ZipSafe -ZipPath $zipPath -DestinationFolder $extractFolder
 
         Remove-Item $zipPath -Force -ErrorAction SilentlyContinue
         Write-Log "Extracted to: $extractFolder" -Level 'SUCCESS'
@@ -425,8 +404,9 @@ function Start-DirectSend {
     Add-FirewallRule -Name $fwRuleName -Port $Port | Out-Null
 
     $files = Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue
-    $fileCount = $files.Count
-    $totalSize = [long]($files | Measure-Object -Property Length -Sum | Select-Object -ExpandProperty Sum)
+    $measure = $files | Measure-Object -Property Length -Sum
+    $fileCount = $measure.Count
+    $totalSize = [long]$measure.Sum
 
     $listener = New-Object System.Net.Sockets.TcpListener([System.Net.IPAddress]::Any, $Port)
     $listener.Start()
@@ -454,6 +434,8 @@ function Start-DirectSend {
         }
 
         $client = $acceptTask.Result
+        $client.SendBufferSize = 262144
+        $client.ReceiveBufferSize = 262144
         $stream = $client.GetStream()
         Write-Log "Receiver connected from $($client.Client.RemoteEndPoint)" -Level 'SUCCESS'
 
@@ -485,7 +467,7 @@ function Start-DirectSend {
 
         $sentBytes = [long]0
         $currentFile = 0
-        $buffer = New-Object byte[] 65536
+        $buffer = New-Object byte[] 262144
 
         foreach ($file in $files) {
             if ($script:CancelRequested) { break }
@@ -572,6 +554,9 @@ function Start-DirectReceive {
             throw "Connection timed out after 10 seconds — check that the sender is running"
         }
         if ($connectTask.IsFaulted) { throw $connectTask.Exception.InnerException }
+        $client.ReceiveTimeout = 30000  # 30s idle timeout
+        $client.ReceiveBufferSize = 262144
+        $client.SendBufferSize = 262144
         $stream = $client.GetStream()
         $reader = New-Object System.IO.BinaryReader($stream)
         $writer = New-Object System.IO.BinaryWriter($stream)
@@ -608,8 +593,8 @@ function Start-DirectReceive {
 
         $receivedBytes = [long]0
         $receivedFiles = 0
-        $errors = @()
-        $buffer = New-Object byte[] 65536
+        $errors = [System.Collections.Generic.List[string]]::new()
+        $buffer = New-Object byte[] 262144
 
         for ($i = 0; $i -lt $fileCount; $i++) {
             if ($script:CancelRequested) { break }
@@ -631,7 +616,7 @@ function Start-DirectReceive {
             $resolvedOutput = [System.IO.Path]::GetFullPath($OutputFolder)
             if (-not $destPath.StartsWith($resolvedOutput)) {
                 Write-Log "Path traversal blocked: $relativePath" -Level 'ERROR'
-                $errors += "Blocked path traversal: $relativePath"
+                $errors.Add("Blocked path traversal: $relativePath")
                 # Drain this file's bytes from the stream so we stay in sync
                 $remaining = $fileSize
                 while ($remaining -gt 0) {
@@ -671,7 +656,7 @@ function Start-DirectReceive {
                 }
                 $receivedFiles++
             } catch {
-                $errors += "Failed: $relativePath - $($_.Exception.Message)"
+                $errors.Add("Failed: $relativePath - $($_.Exception.Message)")
                 Write-Log "Error receiving $relativePath`: $($_.Exception.Message)" -Level 'WARN'
                 # Drain remaining bytes to keep stream protocol in sync
                 if ($remaining -gt 0) {
