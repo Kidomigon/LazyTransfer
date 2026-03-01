@@ -736,18 +736,15 @@ function Start-FilesMigration {
     Write-Log "Mode: $Mode | Folders: $($SelectedFolders -join ', ')"
 
     # Use pre-computed sizes if available, otherwise calculate
+    # If user started migration mid-scan, some folders may be missing — measure those live
     $totalBytes = [long]0
     $folderSizes = @{}
     $folderFileCounts = @{}
-    if ($PrecomputedSizes) {
-        foreach ($name in $SelectedFolders) {
-            $size = if ($PrecomputedSizes.ContainsKey($name)) { [long]$PrecomputedSizes[$name] } else { 0 }
-            $folderSizes[$name] = $size
-            $totalBytes += $size
-        }
-        Write-Log "Using pre-computed folder sizes"
-    } else {
-        foreach ($name in $SelectedFolders) {
+    foreach ($name in $SelectedFolders) {
+        if ($PrecomputedSizes -and $PrecomputedSizes.ContainsKey($name)) {
+            $folderSizes[$name] = [long]$PrecomputedSizes[$name]
+            $totalBytes += $folderSizes[$name]
+        } else {
             $path = Get-UserFolderPath -FolderName $name
             if ($path -and (Test-Path -LiteralPath $path)) {
                 try {
@@ -838,22 +835,23 @@ function Start-FilesMigration {
         Update-GuiStatus
     }
 
-    # Export browser bookmarks
+    # Export browser bookmarks (skip if cancelled)
     $exportedBrowsers = @()
-    if ($SelectedBrowsers.Count -gt 0) {
+    if (-not $script:CancelRequested -and $SelectedBrowsers.Count -gt 0) {
         $currentFolder++
         if ($OnProgress) { & $OnProgress "Browser Bookmarks" $copiedBytes $totalBytes $currentFolder $totalFolders "Exporting..." }
         $exportedBrowsers = Export-BrowserBookmarks -TargetFolder $migrationFolder -Browsers $SelectedBrowsers
         if ($OnProgress) { & $OnProgress "Browser Bookmarks" $copiedBytes $totalBytes $currentFolder $totalFolders "Done" }
     }
 
-    # Write migration manifest
+    # Write migration manifest (always write — records what was actually copied, including cancellation)
     $manifest = [PSCustomObject]@{
         ClientName     = $ClientName
         MigrationDate  = (Get-Date).ToString("o")
         SourceComputer = $env:COMPUTERNAME
         ToolVersion    = $script:AppVersion
         Mode           = $Mode
+        Cancelled      = [bool]$script:CancelRequested
         TotalSizeBytes = $totalBytes
         TotalFiles     = $copiedFiles
         Folders        = $SelectedFolders | ForEach-Object {
@@ -865,13 +863,12 @@ function Start-FilesMigration {
         Bookmarks      = $exportedBrowsers
         Errors         = $errors
     }
-    # Write manifest before ZIP so it's included in the archive
     $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $migrationFolder "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
     Write-Log "Migration manifest saved"
 
-    # ZIP mode: compress and remove temp folder
+    # ZIP mode: compress and remove temp folder (skip if cancelled)
     $finalPath = $migrationFolder
-    if ($Mode -eq "zip") {
+    if (-not $script:CancelRequested -and $Mode -eq "zip") {
         Write-Log "Compressing to ZIP archive..."
         if ($OnProgress) { & $OnProgress "Compressing ZIP" $copiedBytes $totalBytes $totalFolders $totalFolders "Compressing..." }
         Update-GuiStatus
