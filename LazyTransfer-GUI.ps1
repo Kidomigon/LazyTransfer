@@ -26,15 +26,23 @@ function Get-AppIcon {
     try {
         Add-Type -TypeDefinition @"
         using System;
+        using System.Drawing;
         using System.Runtime.InteropServices;
         public class IconExtractor {
             [DllImport("shell32.dll", CharSet = CharSet.Auto)]
             public static extern IntPtr ExtractIcon(IntPtr hInst, string lpszExeFileName, int nIconIndex);
+            [DllImport("user32.dll", SetLastError = true)]
+            public static extern bool DestroyIcon(IntPtr hIcon);
         }
 "@ -ErrorAction SilentlyContinue
         $iconHandle = [IconExtractor]::ExtractIcon([IntPtr]::Zero, "shell32.dll", 13)
         if ($iconHandle -ne [IntPtr]::Zero) {
-            return [System.Drawing.Icon]::FromHandle($iconHandle)
+            # Clone the icon so we can release the native handle
+            $tempIcon = [System.Drawing.Icon]::FromHandle($iconHandle)
+            $clonedIcon = [System.Drawing.Icon]$tempIcon.Clone()
+            $tempIcon.Dispose()
+            [IconExtractor]::DestroyIcon($iconHandle) | Out-Null
+            return $clonedIcon
         }
     } catch { }
     return [System.Drawing.SystemIcons]::Application
@@ -44,7 +52,7 @@ function Get-AppIcon {
 
 #region Global Settings
 $script:AppName = "LazyTransfer"
-$script:AppVersion = "1.0"
+$script:AppVersion = "2.5"
 $script:CurrentPage = "Scan"
 
 $script:NoiseNameRegexes = @(
@@ -77,6 +85,12 @@ function Test-IsNoiseAppName {
 $script:ScriptDir = if ($PSScriptRoot) { $PSScriptRoot } else { Split-Path -Parent $MyInvocation.MyCommand.Definition }
 if ([string]::IsNullOrWhiteSpace($script:ScriptDir)) { $script:ScriptDir = $PWD.Path }
 $script:SettingsFile = Join-Path $script:ScriptDir "settings.json"
+$script:ModulesDir = Join-Path $script:ScriptDir "modules"
+
+# Load modules
+if (Test-Path (Join-Path $script:ModulesDir "NetworkEngine.ps1")) {
+    . (Join-Path $script:ModulesDir "NetworkEngine.ps1")
+}
 
 $script:UserSettings = @{
     LastBundlePath = ""
@@ -285,6 +299,8 @@ $script:Colors = @{
     AccentOrange   = [System.Drawing.Color]::FromArgb(227, 150, 62)
     AccentGray     = [System.Drawing.Color]::FromArgb(100, 100, 100)
     AccentRed      = [System.Drawing.Color]::FromArgb(200, 60, 60)
+    AccentPink     = [System.Drawing.Color]::FromArgb(233, 69, 96)
+    AccentLightBlue = [System.Drawing.Color]::FromArgb(88, 166, 255)
     ButtonBg       = [System.Drawing.Color]::FromArgb(60, 60, 60)
     ButtonHover    = [System.Drawing.Color]::FromArgb(80, 80, 80)
     InputBg        = [System.Drawing.Color]::FromArgb(50, 50, 50)
@@ -392,6 +408,41 @@ function Update-GuiStatus {
 #endregion Helpers
 
 #region Files Migration Helpers
+
+function Expand-ZipSafe {
+    <#
+    .SYNOPSIS
+        Extract a ZIP archive with path traversal (ZIP slip) protection.
+    #>
+    param(
+        [Parameter(Mandatory=$true)][string]$ZipPath,
+        [Parameter(Mandatory=$true)][string]$DestinationFolder
+    )
+    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $resolvedDest = [System.IO.Path]::GetFullPath($DestinationFolder)
+    if (-not (Test-Path $resolvedDest)) { New-Item -Path $resolvedDest -ItemType Directory -Force | Out-Null }
+    $archive = [System.IO.Compression.ZipFile]::OpenRead($ZipPath)
+    try {
+        foreach ($entry in $archive.Entries) {
+            if ([string]::IsNullOrWhiteSpace($entry.FullName)) { continue }
+            $entryDest = [System.IO.Path]::GetFullPath((Join-Path $DestinationFolder $entry.FullName))
+            if (-not $entryDest.StartsWith($resolvedDest)) {
+                Write-Log "ZIP slip blocked: $($entry.FullName)" -Level 'ERROR'
+                continue
+            }
+            if ($entry.FullName.EndsWith('/') -or $entry.FullName.EndsWith('\')) {
+                if (-not (Test-Path $entryDest)) { New-Item -Path $entryDest -ItemType Directory -Force | Out-Null }
+            } else {
+                $entryDir = Split-Path -Parent $entryDest
+                if (-not (Test-Path $entryDir)) { New-Item -Path $entryDir -ItemType Directory -Force | Out-Null }
+                [System.IO.Compression.ZipFileExtensions]::ExtractToFile($entry, $entryDest, $true)
+            }
+        }
+    } finally {
+        $archive.Dispose()
+    }
+}
+
 function Format-FileSize {
     param([Parameter(Mandatory=$true)][long]$Bytes)
     if ($Bytes -ge 1TB) { return "$([Math]::Round($Bytes / 1TB, 1)) TB" }
@@ -424,9 +475,9 @@ function Get-FolderSizes {
         $path = Get-UserFolderPath -FolderName $name
         $sizeBytes = 0
         $fileCount = 0
-        if ($path -and (Test-Path $path)) {
+        if ($path -and (Test-Path -LiteralPath $path)) {
             try {
-                $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                $measure = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
                 if ($measure.Sum) { $sizeBytes = $measure.Sum }
                 $fileCount = $measure.Count
             } catch { }
@@ -461,51 +512,45 @@ function Export-BrowserBookmarks {
         [Parameter(Mandatory=$true)][string]$TargetFolder,
         [Parameter(Mandatory=$true)][string[]]$Browsers
     )
-    $exported = @()
+    $exported = [System.Collections.Generic.List[string]]::new()
     $bookmarksDir = Join-Path $TargetFolder "Bookmarks"
     if (-not (Test-Path $bookmarksDir)) { New-Item -Path $bookmarksDir -ItemType Directory -Force | Out-Null }
 
+    $chromiumBrowsers = @{
+        'Chrome' = @{ Source = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"; BackupName = "Chrome_Bookmarks.json" }
+        'Edge'   = @{ Source = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"; BackupName = "Edge_Bookmarks.json" }
+    }
+
     foreach ($browser in $Browsers) {
         try {
-            switch ($browser) {
-                'Chrome' {
-                    $src = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $dest = Join-Path $bookmarksDir "Chrome_Bookmarks.json"
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $exported += "Chrome"
-                        Write-Log "Exported Chrome bookmarks"
-                    }
+            if ($chromiumBrowsers.ContainsKey($browser)) {
+                $info = $chromiumBrowsers[$browser]
+                if (Test-Path $info.Source) {
+                    $dest = Join-Path $bookmarksDir $info.BackupName
+                    Copy-Item -Path $info.Source -Destination $dest -Force
+                    $exported.Add($browser)
+                    Write-Log "Exported $browser bookmarks"
                 }
-                'Firefox' {
-                    $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -like '*.default*' } | Select-Object -First 1
-                    if ($profileDir) {
-                        $ffDir = Join-Path $bookmarksDir "Firefox"
-                        if (-not (Test-Path $ffDir)) { New-Item -Path $ffDir -ItemType Directory -Force | Out-Null }
-                        $places = Join-Path $profileDir.FullName "places.sqlite"
-                        if (Test-Path $places) {
-                            Copy-Item -Path $places -Destination $ffDir -Force
-                            # Copy WAL and SHM files for SQLite integrity
-                            foreach ($ext in @('-wal', '-shm')) {
-                                $walFile = "${places}${ext}"
-                                if (Test-Path $walFile) { Copy-Item -Path $walFile -Destination $ffDir -Force }
-                            }
+            }
+            elseif ($browser -eq 'Firefox') {
+                $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
+                    Where-Object { $_.Name -like '*.default*' } | Select-Object -First 1
+                if ($profileDir) {
+                    $ffDir = Join-Path $bookmarksDir "Firefox"
+                    if (-not (Test-Path $ffDir)) { New-Item -Path $ffDir -ItemType Directory -Force | Out-Null }
+                    $places = Join-Path $profileDir.FullName "places.sqlite"
+                    if (Test-Path $places) {
+                        Copy-Item -Path $places -Destination $ffDir -Force
+                        # Copy WAL and SHM files for SQLite integrity
+                        foreach ($ext in @('-wal', '-shm')) {
+                            $walFile = "${places}${ext}"
+                            if (Test-Path $walFile) { Copy-Item -Path $walFile -Destination $ffDir -Force }
                         }
-                        $backups = Join-Path $profileDir.FullName "bookmarkbackups"
-                        if (Test-Path $backups) { Copy-Item -Path $backups -Destination $ffDir -Recurse -Force }
-                        $exported += "Firefox"
-                        Write-Log "Exported Firefox bookmarks"
                     }
-                }
-                'Edge' {
-                    $src = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks"
-                    if (Test-Path $src) {
-                        $dest = Join-Path $bookmarksDir "Edge_Bookmarks.json"
-                        Copy-Item -Path $src -Destination $dest -Force
-                        $exported += "Edge"
-                        Write-Log "Exported Edge bookmarks"
-                    }
+                    $backups = Join-Path $profileDir.FullName "bookmarkbackups"
+                    if (Test-Path $backups) { Copy-Item -Path $backups -Destination $ffDir -Recurse -Force }
+                    $exported.Add("Firefox")
+                    Write-Log "Exported Firefox bookmarks"
                 }
             }
         } catch {
@@ -524,10 +569,14 @@ function Get-InstalledPrograms {
         'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\*'
     )
 
-    $rawItems = @()
+    $rawItems = [System.Collections.Generic.List[object]]::new()
     foreach ($root in $uninstallRoots) {
         if (Test-Path $root) {
-            try { $rawItems += Get-ItemProperty $root -ErrorAction SilentlyContinue } catch { }
+            try {
+                foreach ($item in (Get-ItemProperty $root -ErrorAction SilentlyContinue)) {
+                    $rawItems.Add($item)
+                }
+            } catch { }
         }
     }
 
@@ -573,14 +622,22 @@ function Get-InstalledPrograms {
     return $out | Sort-Object DisplayName, DisplayVersion -Unique
 }
 
+$script:InstalledProgramsCache = $null
+
+function Reset-InstalledProgramsCache {
+    $script:InstalledProgramsCache = $null
+}
+
 function Test-ProgramInstalled {
     param([Parameter(Mandatory=$true)][string]$DisplayName)
-    $programs = Get-InstalledPrograms
+    if (-not $script:InstalledProgramsCache) {
+        $script:InstalledProgramsCache = Get-InstalledPrograms
+    }
     $searchName = $DisplayName.ToLowerInvariant()
-    foreach ($p in $programs) {
+    foreach ($p in $script:InstalledProgramsCache) {
         $progName = $p.DisplayName.ToLowerInvariant()
-        if ($progName -eq $searchName -or $progName.Contains($searchName) -or $searchName.Contains($progName)) { 
-            return $true 
+        if ($progName -eq $searchName -or $progName.Contains($searchName) -or $searchName.Contains($progName)) {
+            return $true
         }
     }
     return $false
@@ -621,7 +678,8 @@ function Build-ScanBundle {
     $safeClientName = [System.Web.HttpUtility]::HtmlEncode($ClientName)
     $safeScanTime = [System.Web.HttpUtility]::HtmlEncode($meta.ScanTime)
     $safeComputerName = [System.Web.HttpUtility]::HtmlEncode($meta.ComputerName)
-    $htmlContent = @"
+    $htmlBuilder = New-Object System.Text.StringBuilder 4096
+    [void]$htmlBuilder.Append(@"
 <!DOCTYPE html>
 <html><head><meta charset="utf-8"><title>$safeClientName - Program List</title>
 <style>
@@ -636,14 +694,15 @@ tr:nth-child(even) { background: #2a2a2a; }
 <h2>LazyTransfer - Program List</h2>
 <div class="meta">Client: $safeClientName | Scanned: $safeScanTime | PC: $safeComputerName</div>
 <table><tr><th>Name</th><th>Version</th><th>Publisher</th></tr>
-"@
+"@)
     foreach ($p in $programs) {
         $n = [System.Web.HttpUtility]::HtmlEncode($p.DisplayName)
         $v = [System.Web.HttpUtility]::HtmlEncode($p.DisplayVersion)
         $pub = [System.Web.HttpUtility]::HtmlEncode($p.Publisher)
-        $htmlContent += "<tr><td>$n</td><td>$v</td><td>$pub</td></tr>`n"
+        [void]$htmlBuilder.AppendLine("<tr><td>$n</td><td>$v</td><td>$pub</td></tr>")
     }
-    $htmlContent += "</table></body></html>"
+    [void]$htmlBuilder.Append("</table></body></html>")
+    $htmlContent = $htmlBuilder.ToString()
     $htmlContent | Set-Content -Path $htmlPath -Encoding UTF8
 
     Write-Log "Saved: programs.json, programs.csv, report.html"
@@ -662,6 +721,7 @@ function Start-FilesMigration {
         [Parameter(Mandatory=$true)][string[]]$SelectedFolders,
         [Parameter(Mandatory=$true)][string]$Mode,
         [string[]]$SelectedBrowsers = @(),
+        [hashtable]$PrecomputedSizes = $null,
         [scriptblock]$OnProgress
     )
 
@@ -675,20 +735,28 @@ function Start-FilesMigration {
     Write-Log "Starting files migration for: $ClientName"
     Write-Log "Mode: $Mode | Folders: $($SelectedFolders -join ', ')"
 
-    # Calculate total size for progress tracking
+    # Use pre-computed sizes if available, otherwise calculate
+    # If user started migration mid-scan, some folders may be missing — measure those live
     $totalBytes = [long]0
     $folderSizes = @{}
+    $folderFileCounts = @{}
     foreach ($name in $SelectedFolders) {
-        $path = Get-UserFolderPath -FolderName $name
-        if ($path -and (Test-Path $path)) {
-            try {
-                $measure = Get-ChildItem -Path $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
-                $size = if ($measure.Sum) { [long]$measure.Sum } else { 0 }
-                $folderSizes[$name] = $size
-                $totalBytes += $size
-            } catch { $folderSizes[$name] = 0 }
-        } else { $folderSizes[$name] = 0 }
-        Update-GuiStatus
+        if ($PrecomputedSizes -and $PrecomputedSizes.ContainsKey($name)) {
+            $folderSizes[$name] = [long]$PrecomputedSizes[$name]
+            $totalBytes += $folderSizes[$name]
+        } else {
+            $path = Get-UserFolderPath -FolderName $name
+            if ($path -and (Test-Path -LiteralPath $path)) {
+                try {
+                    $measure = Get-ChildItem -LiteralPath $path -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $size = if ($measure.Sum) { [long]$measure.Sum } else { 0 }
+                    $folderSizes[$name] = $size
+                    $folderFileCounts[$name] = $measure.Count
+                    $totalBytes += $size
+                } catch { $folderSizes[$name] = 0 }
+            } else { $folderSizes[$name] = 0 }
+            Update-GuiStatus
+        }
     }
 
     # Check available disk space (skip for UNC paths)
@@ -697,15 +765,16 @@ function Start-FilesMigration {
             $destDrive = Split-Path -Qualifier $OutputFolder
             if ($destDrive) {
                 $driveInfo = Get-PSDrive -Name ($destDrive.TrimEnd(':')) -ErrorAction SilentlyContinue
-                if ($driveInfo -and $driveInfo.Free -lt ($totalBytes * 1.1)) {
-                    throw "Insufficient disk space. Need $(Format-FileSize ($totalBytes * 1.1)), have $(Format-FileSize $driveInfo.Free)."
+                $spaceMultiplier = if ($Mode -eq "zip") { 2.2 } else { 1.1 }
+                if ($driveInfo -and $driveInfo.Free -lt ($totalBytes * $spaceMultiplier)) {
+                    throw "Insufficient disk space. Need $(Format-FileSize ([long]($totalBytes * $spaceMultiplier))), have $(Format-FileSize $driveInfo.Free)."
                 }
             }
         } catch [System.Management.Automation.RuntimeException] { throw }
         catch { }
     }
 
-    $errors = @()
+    $errors = [System.Collections.Generic.List[string]]::new()
     $copiedBytes = [long]0
     $copiedFiles = 0
     $totalFolders = $SelectedFolders.Count + $(if ($SelectedBrowsers.Count -gt 0) { 1 } else { 0 })
@@ -713,11 +782,16 @@ function Start-FilesMigration {
 
     # Copy each selected folder
     foreach ($name in $SelectedFolders) {
+        if ($script:CancelRequested) {
+            Write-Log "File migration cancelled by user" -Level 'WARN'
+            $errors.Add("Cancelled by user")
+            break
+        }
         $currentFolder++
         $srcPath = Get-UserFolderPath -FolderName $name
         if (-not $srcPath -or -not (Test-Path $srcPath)) {
             Write-Log "Skipping $name - folder not found" -Level 'WARN'
-            $errors += "Folder not found: $name"
+            $errors.Add("Folder not found: $name")
             continue
         }
 
@@ -732,42 +806,52 @@ function Start-FilesMigration {
             # Robocopy exit codes 0-7 indicate success (various levels of files copied/skipped)
             if ($roboProcess.ExitCode -le 7) {
                 $copiedBytes += $folderSizes[$name]
-                try {
-                    $destMeasure = Get-ChildItem -Path $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object
-                    $copiedFiles += $destMeasure.Count
-                } catch { }
+                # Use pre-computed file count when available, avoids re-scanning
+                if ($folderFileCounts.ContainsKey($name)) {
+                    $copiedFiles += $folderFileCounts[$name]
+                } else {
+                    try {
+                        $srcMeasure = Get-ChildItem -LiteralPath $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object
+                        $copiedFiles += $srcMeasure.Count
+                    } catch { }
+                }
                 Write-Log "[OK] $name copied successfully" -Level 'SUCCESS'
             } else {
                 Write-Log "[X] $name copy had errors (robocopy exit: $($roboProcess.ExitCode))" -Level 'ERROR'
-                $errors += "Robocopy error for $name (exit code $($roboProcess.ExitCode))"
-                # Still count partial copy
-                $copiedBytes += $folderSizes[$name]
+                $errors.Add("Robocopy error for $name (exit code $($roboProcess.ExitCode))")
+                # Count only actually copied bytes for accurate progress
+                try {
+                    $partialMeasure = Get-ChildItem -LiteralPath $destPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                    $copiedBytes += if ($partialMeasure.Sum) { [long]$partialMeasure.Sum } else { 0 }
+                    $copiedFiles += $partialMeasure.Count
+                } catch { }
             }
         } catch {
             Write-Log "[X] Failed to copy $name`: $($_.Exception.Message)" -Level 'ERROR'
-            $errors += "Failed: $name - $($_.Exception.Message)"
+            $errors.Add("Failed: $name - $($_.Exception.Message)")
         }
 
         if ($OnProgress) { & $OnProgress $name $copiedBytes $totalBytes $currentFolder $totalFolders "Done" }
         Update-GuiStatus
     }
 
-    # Export browser bookmarks
+    # Export browser bookmarks (skip if cancelled)
     $exportedBrowsers = @()
-    if ($SelectedBrowsers.Count -gt 0) {
+    if (-not $script:CancelRequested -and $SelectedBrowsers.Count -gt 0) {
         $currentFolder++
         if ($OnProgress) { & $OnProgress "Browser Bookmarks" $copiedBytes $totalBytes $currentFolder $totalFolders "Exporting..." }
         $exportedBrowsers = Export-BrowserBookmarks -TargetFolder $migrationFolder -Browsers $SelectedBrowsers
         if ($OnProgress) { & $OnProgress "Browser Bookmarks" $copiedBytes $totalBytes $currentFolder $totalFolders "Done" }
     }
 
-    # Write migration manifest
+    # Write migration manifest (always write — records what was actually copied, including cancellation)
     $manifest = [PSCustomObject]@{
         ClientName     = $ClientName
         MigrationDate  = (Get-Date).ToString("o")
         SourceComputer = $env:COMPUTERNAME
         ToolVersion    = $script:AppVersion
         Mode           = $Mode
+        Cancelled      = [bool]$script:CancelRequested
         TotalSizeBytes = $totalBytes
         TotalFiles     = $copiedFiles
         Folders        = $SelectedFolders | ForEach-Object {
@@ -779,9 +863,12 @@ function Start-FilesMigration {
         Bookmarks      = $exportedBrowsers
         Errors         = $errors
     }
-    # ZIP mode: compress and remove temp folder
+    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $migrationFolder "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
+    Write-Log "Migration manifest saved"
+
+    # ZIP mode: compress and remove temp folder (skip if cancelled)
     $finalPath = $migrationFolder
-    if ($Mode -eq "zip") {
+    if (-not $script:CancelRequested -and $Mode -eq "zip") {
         Write-Log "Compressing to ZIP archive..."
         if ($OnProgress) { & $OnProgress "Compressing ZIP" $copiedBytes $totalBytes $totalFolders $totalFolders "Compressing..." }
         Update-GuiStatus
@@ -794,19 +881,13 @@ function Start-FilesMigration {
             Write-Log "[OK] ZIP archive created: $zipPath" -Level 'SUCCESS'
         } catch {
             Write-Log "ZIP compression failed, keeping uncompressed folder: $($_.Exception.Message)" -Level 'WARN'
-            $errors += "ZIP failed: $($_.Exception.Message)"
+            $errors.Add("ZIP failed: $($_.Exception.Message)")
+            # Clean up partial ZIP to avoid confusion and save disk space
+            if (Test-Path $zipPath) { Remove-Item $zipPath -Force -ErrorAction SilentlyContinue }
         }
 
         if ($OnProgress) { & $OnProgress "Complete" $totalBytes $totalBytes $totalFolders $totalFolders "Done" }
     }
-
-    # Write manifest AFTER ZIP step so errors are captured
-    $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path $finalPath "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
-    if (-not (Test-Path (Join-Path $finalPath "migration-manifest.json"))) {
-        # If finalPath is a zip, write manifest alongside it
-        $manifest | ConvertTo-Json -Depth 4 | Set-Content -Path (Join-Path (Split-Path $finalPath) "migration-manifest.json") -Encoding UTF8 -ErrorAction SilentlyContinue
-    }
-    Write-Log "Migration manifest saved"
 
     try { Stop-Transcript | Out-Null } catch { }
 
@@ -887,13 +968,13 @@ function Search-WingetPackage {
         
         $lines = $output -split "`n" | Where-Object { $_ -match '\S' }
         $dataStarted = $false
-        $results = @()
-        
+        $results = [System.Collections.Generic.List[object]]::new()
+
         foreach ($line in $lines) {
             if ($line -match '^-+') { $dataStarted = $true; continue }
             if (-not $dataStarted) { continue }
             if ($line -match '^(.+?)\s{2,}(\S+\.\S+)\s') {
-                $results += [PSCustomObject]@{ Name = $matches[1].Trim(); Id = $matches[2].Trim() }
+                $results.Add([PSCustomObject]@{ Name = $matches[1].Trim(); Id = $matches[2].Trim() })
             }
         }
         
@@ -1020,26 +1101,40 @@ function Install-ProgramsFromBundle {
     $bundle = Get-Content $BundleJsonPath -Raw -Encoding UTF8 | ConvertFrom-Json
     if (-not $bundle.Programs) { throw "Invalid bundle file." }
 
+    # Filter out null/empty display names to prevent parameter binding errors
+    $SelectedDisplayNames = @($SelectedDisplayNames | Where-Object { $_ -and -not [string]::IsNullOrWhiteSpace($_) })
+    if ($SelectedDisplayNames.Count -eq 0) {
+        Write-Log "No valid programs selected for installation" -Level 'WARN'
+        return @()
+    }
+
     $wingetOk = Ensure-Winget -AutoInstall:$AutoInstallWinget
     Write-Log "Winget: $(if ($wingetOk) { 'Ready' } else { 'Not available' })"
     
     $chocoOk = Ensure-Chocolatey -AutoInstall:$AutoInstallChocolatey
     Write-Log "Chocolatey: $(if ($chocoOk) { 'Ready' } else { 'Not available' })"
 
-    $results = @()
-    $manualQueue = @()
-    $failedQueue = @()
-    $stillMissing = @()
+    # Reset the installed programs cache so verification reads fresh data
+    Reset-InstalledProgramsCache
+
+    $results = [System.Collections.Generic.List[object]]::new()
+    $manualQueue = [System.Collections.Generic.List[string]]::new()
+    $failedQueue = [System.Collections.Generic.List[string]]::new()
+    $stillMissing = [System.Collections.Generic.List[string]]::new()
     
     $total = $SelectedDisplayNames.Count
     $current = 0
 
     foreach ($name in $SelectedDisplayNames) {
+        if ($script:CancelRequested) {
+            Write-Log "Installation cancelled by user" -Level 'WARN'
+            break
+        }
         $current++
         if ($OnProgress) { & $OnProgress $name $current $total "Processing..." }
-        
+
         if (Test-IsNoiseAppName -DisplayName $name) {
-            $results += [PSCustomObject]@{ DisplayName=$name; Status="Skipped"; Method="Noise"; Verified=$false }
+            $results.Add([PSCustomObject]@{ DisplayName=$name; Status="Skipped"; Method="Noise"; Verified=$false })
             continue
         }
 
@@ -1063,8 +1158,9 @@ function Install-ProgramsFromBundle {
                     $method = "Winget"
                     $installed = $true
                     Start-Sleep -Milliseconds 500
+                    Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
-                    if (-not $verified) { $stillMissing += $name }
+                    if (-not $verified) { $stillMissing.Add($name) }
                 }
             }
 
@@ -1078,35 +1174,36 @@ function Install-ProgramsFromBundle {
                     $method = "Chocolatey"
                     $installed = $true
                     Start-Sleep -Milliseconds 500
+                    Reset-InstalledProgramsCache
                     $verified = Test-ProgramInstalled -DisplayName $name
-                    if (-not $verified) { $stillMissing += $name }
+                    if (-not $verified) { $stillMissing.Add($name) }
                 }
             }
 
             if (-not $installed) {
                 if ($target.WingetId -or $target.ChocoId) {
                     $status = "Failed"
-                    $failedQueue += $name
+                    $failedQueue.Add($name)
                 } else {
                     $status = "Manual"
                     $method = "Not Found"
-                    $manualQueue += $name
-                    $stillMissing += $name
+                    $manualQueue.Add($name)
+                    $stillMissing.Add($name)
                 }
             }
         } catch {
             $status = "Failed"
-            $failedQueue += $name
+            $failedQueue.Add($name)
             Write-Log "Error: $name - $($_.Exception.Message)"
         }
 
-        $results += [PSCustomObject]@{
+        $results.Add([PSCustomObject]@{
             DisplayName = $name
             Status = $status
             Method = $method
             Verified = $verified
-        }
-        
+        })
+
         if ($OnProgress) { & $OnProgress $name $current $total $status }
         Update-GuiStatus
     }
@@ -1126,6 +1223,405 @@ function Install-ProgramsFromBundle {
 }
 #endregion Install Engine
 
+#region Restore Engine
+
+function Import-BrowserBookmarks {
+    param(
+        [Parameter(Mandatory=$true)][string]$SourceFolder,
+        [string[]]$Browsers = @('Chrome', 'Firefox', 'Edge')
+    )
+    $results = [System.Collections.Generic.List[object]]::new()
+    $bookmarksDir = Join-Path $SourceFolder "Bookmarks"
+    if (-not (Test-Path $bookmarksDir)) {
+        Write-Log "No Bookmarks subfolder found in source" -Level 'WARN'
+        return $results
+    }
+
+    foreach ($browser in $Browsers) {
+        try {
+            if (-not (Test-BrowserInstalled -BrowserName $browser)) {
+                Write-Log "$browser not installed, skipping bookmark restore" -Level 'WARN'
+                $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Skipped - not installed" })
+                continue
+            }
+
+            $chromiumBrowsers = @{
+                'Chrome' = @{ BackupName = "Chrome_Bookmarks.json"; Dest = "$env:LOCALAPPDATA\Google\Chrome\User Data\Default\Bookmarks" }
+                'Edge'   = @{ BackupName = "Edge_Bookmarks.json"; Dest = "$env:LOCALAPPDATA\Microsoft\Edge\User Data\Default\Bookmarks" }
+            }
+
+            if ($chromiumBrowsers.ContainsKey($browser)) {
+                $info = $chromiumBrowsers[$browser]
+                $src = Join-Path $bookmarksDir $info.BackupName
+                $dest = $info.Dest
+                if (Test-Path $src) {
+                    $destDir = Split-Path -Parent $dest
+                    if (-not (Test-Path $destDir)) { New-Item -Path $destDir -ItemType Directory -Force | Out-Null }
+                    if (Test-Path $dest) {
+                        $bakName = "${dest}.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                        if (-not (Test-Path "${dest}.bak")) { $bakName = "${dest}.bak" }
+                        Copy-Item -Path $dest -Destination $bakName -Force
+                    }
+                    Copy-Item -Path $src -Destination $dest -Force
+                    $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Restored" })
+                    Write-Log "$browser bookmarks restored" -Level 'SUCCESS'
+                } else {
+                    $results.Add([PSCustomObject]@{ Browser = $browser; Status = "No backup found" })
+                }
+            }
+            elseif ($browser -eq 'Firefox') {
+                    $ffSrc = Join-Path $bookmarksDir "Firefox"
+                    if (Test-Path $ffSrc) {
+                        $profileDir = Get-ChildItem "$env:APPDATA\Mozilla\Firefox\Profiles" -Directory -ErrorAction SilentlyContinue |
+                            Where-Object { $_.Name -like '*.default*' } | Select-Object -First 1
+                        if ($profileDir) {
+                            $places = Join-Path $ffSrc "places.sqlite"
+                            if (Test-Path $places) {
+                                $destPlaces = Join-Path $profileDir.FullName "places.sqlite"
+                                if (Test-Path $destPlaces) {
+                                    $bakName = "${destPlaces}.bak.$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+                                    if (-not (Test-Path "${destPlaces}.bak")) { $bakName = "${destPlaces}.bak" }
+                                    Copy-Item -Path $destPlaces -Destination $bakName -Force
+                                }
+                                Copy-Item -Path $places -Destination $profileDir.FullName -Force
+                                foreach ($ext in @('-wal', '-shm')) {
+                                    $walFile = "${places}${ext}"
+                                    if (Test-Path $walFile) { Copy-Item -Path $walFile -Destination $profileDir.FullName -Force }
+                                }
+                            }
+                            $backups = Join-Path $ffSrc "bookmarkbackups"
+                            if (Test-Path $backups) { Copy-Item -Path $backups -Destination $profileDir.FullName -Recurse -Force }
+                            $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "Restored" })
+                            Write-Log "Firefox bookmarks restored" -Level 'SUCCESS'
+                        } else {
+                            $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "No profile found" })
+                        }
+                    } else {
+                        $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "No backup found" })
+                    }
+                }
+            }
+        } catch {
+            Write-Log "Failed to restore $browser bookmarks: $($_.Exception.Message)" -Level 'ERROR'
+            $results.Add([PSCustomObject]@{ Browser = $browser; Status = "Error: $($_.Exception.Message)" })
+        }
+    }
+    return $results
+}
+
+function Restore-FilesMigration {
+    param(
+        [Parameter(Mandatory=$true)][string]$BundlePath,
+        [string[]]$SelectedFolders = @(),
+        [string[]]$SelectedBrowsers = @(),
+        [scriptblock]$OnProgress
+    )
+
+    $tempExtract = $null
+    $sourcePath = $BundlePath
+
+    # If ZIP, extract to temp first
+    if ($BundlePath -like '*.zip' -and (Test-Path $BundlePath)) {
+        $tempExtract = Join-Path $env:TEMP "LazyTransfer-Restore-$(Get-Date -Format 'yyyyMMdd_HHmmss')"
+        Write-Log "Extracting ZIP bundle..."
+        if ($OnProgress) { & $OnProgress "Extracting" 0 0 0 0 "Extracting ZIP..." }
+        Expand-ZipSafe -ZipPath $BundlePath -DestinationFolder $tempExtract
+        $sourcePath = $tempExtract
+        Write-Log "Extracted to temp folder" -Level 'SUCCESS'
+    }
+
+    $errors = [System.Collections.Generic.List[string]]::new()
+    $totalBytesRestored = [long]0
+    $foldersRestored = 0
+    $bookmarksRestored = @()
+
+    try {
+        # Read manifest
+        $manifest = $null
+        $manifestPath = Join-Path $sourcePath "migration-manifest.json"
+        if (Test-Path $manifestPath) {
+            $manifest = Get-Content $manifestPath -Raw -Encoding UTF8 | ConvertFrom-Json
+        }
+
+        $totalSteps = $SelectedFolders.Count + $(if ($SelectedBrowsers.Count -gt 0) { 1 } else { 0 })
+        $currentStep = 0
+
+        # Restore each folder
+        foreach ($name in $SelectedFolders) {
+            if ($script:CancelRequested) { break }
+            $currentStep++
+            $srcPath = Join-Path $sourcePath $name
+            if (-not (Test-Path $srcPath)) {
+                Write-Log "Folder not found in bundle: $name" -Level 'WARN'
+                $errors.Add("Folder not in bundle: $name")
+                continue
+            }
+
+            $destPath = Get-UserFolderPath -FolderName $name
+            if (-not $destPath) {
+                $errors.Add("Unknown folder: $name")
+                continue
+            }
+
+            Write-Log "Restoring $name to $destPath..."
+            if ($OnProgress) { & $OnProgress $name 0 0 $currentStep $totalSteps "Restoring..." }
+
+            try {
+                # robocopy merge mode (no /PURGE)
+                $roboArgs = @($srcPath, $destPath, '/E', '/COPY:DAT', '/R:1', '/W:1', '/NP', '/MT:4', '/NFL', '/NDL')
+                $roboProcess = Start-Process -FilePath "robocopy" -ArgumentList $roboArgs -Wait -PassThru -WindowStyle Hidden
+                if ($roboProcess.ExitCode -le 7) {
+                    $foldersRestored++
+                    try {
+                        $measure = Get-ChildItem -LiteralPath $srcPath -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                        if ($measure.Sum) { $totalBytesRestored += [long]$measure.Sum }
+                    } catch { }
+                    Write-Log "[OK] $name restored" -Level 'SUCCESS'
+                } else {
+                    $errors.Add("Robocopy error for $name (exit $($roboProcess.ExitCode))")
+                    Write-Log "[X] $name restore had errors" -Level 'ERROR'
+                }
+            } catch {
+                $errors.Add("Failed: $name - $($_.Exception.Message)")
+                Write-Log "[X] Failed to restore $name" -Level 'ERROR'
+            }
+            if ($OnProgress) { & $OnProgress $name $totalBytesRestored 0 $currentStep $totalSteps "Done" }
+            Update-GuiStatus
+        }
+
+        # Restore bookmarks
+        if ($SelectedBrowsers.Count -gt 0) {
+            $currentStep++
+            if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Restoring bookmarks..." }
+            $bookmarksRestored = Import-BrowserBookmarks -SourceFolder $sourcePath -Browsers $SelectedBrowsers
+            if ($OnProgress) { & $OnProgress "Bookmarks" 0 0 $currentStep $totalSteps "Done" }
+        }
+    } finally {
+        # Always cleanup temp extraction, even on error
+        if ($tempExtract -and (Test-Path $tempExtract)) {
+            try { Remove-Item $tempExtract -Recurse -Force } catch { }
+        }
+    }
+
+    return [PSCustomObject]@{
+        Success          = ($errors.Count -eq 0)
+        TotalBytes       = $totalBytesRestored
+        FoldersRestored  = $foldersRestored
+        BookmarksRestored = $bookmarksRestored
+        Errors           = $errors
+    }
+}
+
+function Find-BundleContents {
+    param([Parameter(Mandatory=$true)][string]$Path)
+
+    $result = [PSCustomObject]@{
+        Programs = [PSCustomObject]@{ Found = $false; Path = $null; Count = 0 }
+        Files    = [PSCustomObject]@{ Found = $false; Path = $null; Folders = @(); TotalSize = [long]0 }
+        System   = [PSCustomObject]@{ Found = $false; Path = $null; Items = @() }
+        Bookmarks = [PSCustomObject]@{ Found = $false; Path = $null; Browsers = @() }
+        Meta     = [PSCustomObject]@{ SourcePC = ""; Date = ""; ToolVersion = "" }
+    }
+
+    # Look for programs.json
+    $programsJson = Join-Path $Path "programs.json"
+    if (Test-Path $programsJson) {
+        try {
+            $bundle = Get-Content $programsJson -Raw -Encoding UTF8 | ConvertFrom-Json
+            $result.Programs = [PSCustomObject]@{
+                Found = $true
+                Path  = $programsJson
+                Count = @($bundle.Programs).Count
+            }
+            if ($bundle.Meta) {
+                $result.Meta = [PSCustomObject]@{
+                    SourcePC    = if ($bundle.Meta.ComputerName) { $bundle.Meta.ComputerName } else { "" }
+                    Date        = if ($bundle.Meta.ScanTime) { $bundle.Meta.ScanTime } else { "" }
+                    ToolVersion = if ($bundle.Meta.ToolVersion) { $bundle.Meta.ToolVersion } else { "" }
+                }
+            }
+        } catch { }
+    }
+
+    # Look for SystemMigration/ folder
+    $systemDir = Join-Path $Path "SystemMigration"
+    if (Test-Path $systemDir) {
+        $items = @()
+        if (Test-Path (Join-Path $systemDir "wifi-profiles")) { $items += "WiFi" }
+        if (Test-Path (Join-Path $systemDir "ssh")) { $items += "SSH" }
+        if (Test-Path (Join-Path $systemDir "git-config")) { $items += "Git" }
+        if (Test-Path (Join-Path $systemDir "env-vars.json")) { $items += "Environment Variables" }
+        $result.System = [PSCustomObject]@{
+            Found = $true
+            Path  = $systemDir
+            Items = $items
+        }
+    }
+
+    # Look for LazyTransfer-Files-* folder or ZIP
+    $filesFolders = Get-ChildItem -Path $Path -Directory -Filter "LazyTransfer-Files-*" -ErrorAction SilentlyContinue
+    $filesZips = Get-ChildItem -Path $Path -File -Filter "LazyTransfer-Files-*.zip" -ErrorAction SilentlyContinue
+
+    $filesSource = $null
+    if ($filesFolders) {
+        $filesSource = $filesFolders | Select-Object -First 1
+    }
+    # Also check if the path itself IS a files migration folder (contains migration-manifest.json)
+    $manifestPath = Join-Path $Path "migration-manifest.json"
+    if (Test-Path $manifestPath) {
+        $filesSource = Get-Item $Path
+    }
+
+    if ($filesSource -or $filesZips) {
+        $scanPath = if ($filesSource) { $filesSource.FullName } else { $null }
+        $folders = [System.Collections.Generic.List[object]]::new()
+        $totalSize = [long]0
+        $manifest = $null
+
+        # Read manifest first — use stored sizes when available
+        if ($scanPath) {
+            $mf = Join-Path $scanPath "migration-manifest.json"
+            if (Test-Path $mf) {
+                try {
+                    $manifest = Get-Content $mf -Raw -Encoding UTF8 | ConvertFrom-Json
+                    if ($manifest.SourceComputer -and -not $result.Meta.SourcePC) {
+                        $result.Meta = [PSCustomObject]@{
+                            SourcePC    = $manifest.SourceComputer
+                            Date        = if ($manifest.MigrationDate) { $manifest.MigrationDate } else { "" }
+                            ToolVersion = if ($manifest.ToolVersion) { $manifest.ToolVersion } else { "" }
+                        }
+                    }
+                } catch { $manifest = $null }
+            }
+        }
+
+        # Build folder list: prefer manifest sizes, fall back to recursive scan
+        if ($scanPath) {
+            $manifestSizes = @{}
+            if ($manifest -and $manifest.Folders) {
+                foreach ($mfFolder in $manifest.Folders) {
+                    if ($mfFolder.Name -and $mfFolder.SizeBytes) { $manifestSizes[$mfFolder.Name] = [long]$mfFolder.SizeBytes }
+                }
+            }
+
+            $folderNames = @('Documents', 'Downloads', 'Pictures', 'Videos', 'Music', 'Desktop')
+            foreach ($fn in $folderNames) {
+                $fp = Join-Path $scanPath $fn
+                if (Test-Path $fp) {
+                    if ($manifestSizes.ContainsKey($fn)) {
+                        $size = $manifestSizes[$fn]
+                    } else {
+                        $size = 0
+                        try {
+                            $measure = Get-ChildItem -LiteralPath $fp -Recurse -File -ErrorAction SilentlyContinue | Measure-Object -Property Length -Sum
+                            if ($measure.Sum) { $size = [long]$measure.Sum }
+                        } catch { }
+                    }
+                    $folders.Add([PSCustomObject]@{ Name = $fn; SizeBytes = $size })
+                    $totalSize += $size
+                }
+            }
+        }
+
+        $result.Files = [PSCustomObject]@{
+            Found     = $true
+            Path      = if ($filesSource) { $filesSource.FullName } elseif ($filesZips) { $filesZips[0].FullName } else { $null }
+            Folders   = $folders
+            TotalSize = $totalSize
+        }
+    }
+
+    # Look for Bookmarks/ subfolder
+    # Check both in root and in any files migration subfolder
+    $bookmarksDir = Join-Path $Path "Bookmarks"
+    if (-not (Test-Path $bookmarksDir) -and $filesSource) {
+        $bookmarksDir = Join-Path $filesSource.FullName "Bookmarks"
+    }
+    if (Test-Path $bookmarksDir) {
+        $browsers = [System.Collections.Generic.List[string]]::new()
+        if (Test-Path (Join-Path $bookmarksDir "Chrome_Bookmarks.json")) { $browsers.Add("Chrome") }
+        if (Test-Path (Join-Path $bookmarksDir "Edge_Bookmarks.json")) { $browsers.Add("Edge") }
+        if (Test-Path (Join-Path $bookmarksDir "Firefox")) { $browsers.Add("Firefox") }
+        $result.Bookmarks = [PSCustomObject]@{
+            Found    = $true
+            Path     = $bookmarksDir
+            Browsers = $browsers
+        }
+    }
+
+    return $result
+}
+
+function Start-FullRestore {
+    param(
+        [Parameter(Mandatory=$true)][string]$BundlePath,
+        [PSCustomObject]$BundleContents = $null,
+        [hashtable]$Selections = @{},
+        [scriptblock]$OnPhaseChange,
+        [scriptblock]$OnProgress
+    )
+
+    if (-not $BundleContents) {
+        $BundleContents = Find-BundleContents -Path $BundlePath
+    }
+
+    $results = [PSCustomObject]@{
+        System   = $null
+        Programs = $null
+        Files    = $null
+        Errors   = @()
+    }
+
+    # Phase 1: System settings
+    if ($Selections.ContainsKey('System') -and $Selections.System -and $BundleContents.System.Found) {
+        if ($OnPhaseChange) { & $OnPhaseChange "System" "Restoring system settings..." }
+        try {
+            if (Get-Command Start-SystemImport -ErrorAction SilentlyContinue) {
+                $results.System = Start-SystemImport -BundlePath $BundlePath -SelectedItems $Selections.System -OnProgress $OnProgress
+            } else {
+                Write-Log "SystemEngine not loaded, skipping system restore" -Level 'WARN'
+                $results.Errors += "SystemEngine not available"
+            }
+        } catch {
+            Write-Log "System restore failed: $($_.Exception.Message)" -Level 'ERROR'
+            $results.Errors += "System: $($_.Exception.Message)"
+        }
+    }
+
+    # Phase 2: Programs (slowest, needs network)
+    if ($Selections.ContainsKey('Programs') -and $Selections.Programs -eq $true -and $BundleContents.Programs.Found) {
+        if ($OnPhaseChange) { & $OnPhaseChange "Programs" "Installing programs..." }
+        try {
+            $programsJson = $BundleContents.Programs.Path
+            $bundle = Get-Content $programsJson -Raw -Encoding UTF8 | ConvertFrom-Json
+            $selectedNames = @($bundle.Programs | ForEach-Object { $_.DisplayName })
+            $results.Programs = Install-ProgramsFromBundle -BundleJsonPath $programsJson -SelectedDisplayNames $selectedNames -AutoInstallWinget -AutoInstallChocolatey -OnProgress $OnProgress
+        } catch {
+            Write-Log "Program install failed: $($_.Exception.Message)" -Level 'ERROR'
+            $results.Errors += "Programs: $($_.Exception.Message)"
+        }
+    }
+
+    # Phase 3: Files + Bookmarks (needs browsers installed)
+    $hasFiles = $Selections.ContainsKey('Files') -and $Selections.Files -and $BundleContents.Files.Found
+    $hasBookmarks = $Selections.ContainsKey('Bookmarks') -and $Selections.Bookmarks -and $BundleContents.Bookmarks.Found
+    if ($hasFiles -or $hasBookmarks) {
+        if ($OnPhaseChange) { & $OnPhaseChange "Files" "Restoring files and bookmarks..." }
+        try {
+            $fileFolders = if ($Selections.Files -is [array]) { $Selections.Files } else { @() }
+            $fileBrowsers = if ($Selections.Bookmarks -is [array]) { $Selections.Bookmarks } else { @() }
+            $filesPath = if ($BundleContents.Files.Path) { $BundleContents.Files.Path } else { $BundlePath }
+            $results.Files = Restore-FilesMigration -BundlePath $filesPath -SelectedFolders $fileFolders -SelectedBrowsers $fileBrowsers -OnProgress $OnProgress
+        } catch {
+            Write-Log "Files restore failed: $($_.Exception.Message)" -Level 'ERROR'
+            $results.Errors += "Files: $($_.Exception.Message)"
+        }
+    }
+
+    return $results
+}
+#endregion Restore Engine
+
 #region GUI
 
 $script:LogTextBox = $null
@@ -1133,6 +1629,7 @@ $script:StatusLabel = $null
 $script:ContentPanel = $null
 $script:SidebarButtons = @{}
 $script:OperationInProgress = $false
+$script:CancelRequested = $false
 $script:LastMigrationPath = $null
 
 function New-StyledButton {
@@ -1203,9 +1700,18 @@ function Set-ActiveSidebarButton {
     }
 }
 
+function Clear-ContentPanel {
+    if ($script:ContentPanel) {
+        foreach ($ctrl in @($script:ContentPanel.Controls)) {
+            try { $ctrl.Dispose() } catch { }
+        }
+        $script:ContentPanel.Controls.Clear()
+    }
+}
+
 function Show-ScanPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Scan"
     Update-StatusBar "Ready to scan"
     
@@ -1308,13 +1814,14 @@ function Show-ScanPage {
 
 function Show-InstallPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Install"
     Update-StatusBar "Ready to install"
     
     $script:InstallAllPrograms = @()
     $script:InstallManualQueue = @()
     $script:InstallFailedQueue = @()
+    $script:InstallCheckStates = @{}
     
     $title = New-Object System.Windows.Forms.Label
     $title.Text = "Install Programs"
@@ -1384,7 +1891,7 @@ function Show-InstallPage {
     $script:CategoryCounts = @{}
 
     # Create category buttons
-    $categoryList = @('Browsers', 'DevTools', 'Media', 'Office', 'Communication', 'Utilities', 'Gaming', 'Security', 'Other')
+    $categoryList = @('Browsers', 'DevTools', 'Media', 'Graphics', 'Office', 'Communication', 'Utilities', 'Gaming', 'Security', 'Other')
     foreach ($cat in $categoryList) {
         $catInfo = Get-CategoryInfo -Category $cat
         $catBtn = New-Object System.Windows.Forms.Button
@@ -1411,6 +1918,13 @@ function Show-InstallPage {
     $listPrograms.ForeColor = $script:Colors.TextPrimary
     $listPrograms.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
     $listPrograms.CheckOnClick = $true
+
+    # Track user check state changes
+    $listPrograms.Add_ItemCheck({
+        param($sender, $e)
+        $itemName = [string]$sender.Items[$e.Index]
+        $script:InstallCheckStates[$itemName] = ($e.NewValue -eq [System.Windows.Forms.CheckState]::Checked)
+    }.GetNewClosure())
 
     # Wire up category button click handlers
     foreach ($cat in $categoryList) {
@@ -1511,12 +2025,21 @@ function Show-InstallPage {
     $btnInstall.Location = New-Object System.Drawing.Point(230, 465)
     $btnInstall.Enabled = $false
     
+    $btnCancel = New-StyledButton -Text "Cancel" -Width 80 -Height 35 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnCancel.Location = New-Object System.Drawing.Point(405, 465)
+    $btnCancel.Visible = $false
+    $btnCancel.Add_Click({
+        $script:CancelRequested = $true
+        $btnCancel.Enabled = $false
+        $btnCancel.Text = "Stopping..."
+    }.GetNewClosure())
+
     $btnRetry = New-StyledButton -Text "Retry Failed" -Width 100 -Height 30 -BackColor $script:Colors.AccentOrange -ForeColor $script:Colors.TextDark
-    $btnRetry.Location = New-Object System.Drawing.Point(440, 465)
+    $btnRetry.Location = New-Object System.Drawing.Point(500, 465)
     $btnRetry.Enabled = $false
-    
+
     $btnManual = New-StyledButton -Text "Open Manual" -Width 100 -Height 30 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
-    $btnManual.Location = New-Object System.Drawing.Point(545, 465)
+    $btnManual.Location = New-Object System.Drawing.Point(605, 465)
     $btnManual.Enabled = $false
     
     $btnBrowseBundle.Add_Click({
@@ -1555,8 +2078,11 @@ function Show-InstallPage {
             # Reset category counts
             foreach ($cat in $script:CategoryCounts.Keys) { $script:CategoryCounts[$cat] = 0 }
 
+            # Initialize check states
+            $script:InstallCheckStates = @{}
             foreach ($p in $script:InstallAllPrograms) {
                 $checked = -not (Test-IsNoiseAppName -DisplayName $p.Name)
+                $script:InstallCheckStates[$p.Name] = $checked
                 [void]$listPrograms.Items.Add($p.Name, $checked)
                 # Count categories
                 if ($script:CategoryCounts.ContainsKey($p.Category)) {
@@ -1598,7 +2124,7 @@ function Show-InstallPage {
         foreach ($p in $script:InstallAllPrograms) {
             $searchText = "$($p.Name) $($p.Publisher)".ToLowerInvariant()
             if ([string]::IsNullOrWhiteSpace($filter) -or $searchText.Contains($filter)) {
-                $checked = -not (Test-IsNoiseAppName -DisplayName $p.Name)
+                $checked = if ($script:InstallCheckStates.ContainsKey($p.Name)) { $script:InstallCheckStates[$p.Name] } else { -not (Test-IsNoiseAppName -DisplayName $p.Name) }
                 [void]$listPrograms.Items.Add($p.Name, $checked)
             }
         }
@@ -1632,6 +2158,10 @@ function Show-InstallPage {
             $btnRetry.Enabled = $false
             $btnManual.Enabled = $false
             $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnCancel.Visible = $true
+            $btnCancel.Enabled = $true
+            $btnCancel.Text = "Cancel"
             $txtResults.Clear()
             $progress.Maximum = $selected.Count
             $progress.Value = 0
@@ -1735,10 +2265,12 @@ function Show-InstallPage {
             [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
         } finally {
             $script:OperationInProgress = $false
+            $script:CancelRequested = $false
             $btnInstall.Enabled = $true
+            $btnCancel.Visible = $false
         }
     }.GetNewClosure())
-    
+
     $btnRetry.Add_Click({
         for ($i = 0; $i -lt $listPrograms.Items.Count; $i++) {
             $name = [string]$listPrograms.Items[$i]
@@ -1763,12 +2295,12 @@ function Show-InstallPage {
         $btnManual.Enabled = $false
     }.GetNewClosure())
     
-    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $lblBundle, $txtBundle, $btnBrowseBundle, $btnLoad, $lblFilter, $txtFilter, $categoryPanel, $listPrograms, $lblResults, $txtResults, $progressPanel, $btnSelectAll, $btnSelectNone, $btnInstall, $btnRetry, $btnManual))
+    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $lblBundle, $txtBundle, $btnBrowseBundle, $btnLoad, $lblFilter, $txtFilter, $categoryPanel, $listPrograms, $lblResults, $txtResults, $progressPanel, $btnSelectAll, $btnSelectNone, $btnInstall, $btnCancel, $btnRetry, $btnManual))
 }
 
 function Show-FilesPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Files"
     Update-StatusBar "Ready for files migration"
 
@@ -1937,6 +2469,16 @@ function Show-FilesPage {
     $btnStartMigration.Font = New-Object System.Drawing.Font("Segoe UI", 12, [System.Drawing.FontStyle]::Bold)
     $btnStartMigration.Location = New-Object System.Drawing.Point(20, 390)
 
+    $btnCancelMigration = New-StyledButton -Text "Cancel" -Width 100 -Height 45 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnCancelMigration.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $btnCancelMigration.Location = New-Object System.Drawing.Point(250, 390)
+    $btnCancelMigration.Visible = $false
+    $btnCancelMigration.Add_Click({
+        $script:CancelRequested = $true
+        $btnCancelMigration.Enabled = $false
+        $btnCancelMigration.Text = "Stopping..."
+    }.GetNewClosure())
+
     # --- Progress Panel (hidden initially) ---
     $progressPanel = New-Object System.Windows.Forms.Panel
     $progressPanel.Location = New-Object System.Drawing.Point(20, 445)
@@ -2052,8 +2594,12 @@ function Show-FilesPage {
 
             # Disable controls during migration
             $script:OperationInProgress = $true
+            $script:CancelRequested = $false
             $btnStartMigration.Enabled = $false
             $btnStartMigration.Text = "Migrating..."
+            $btnCancelMigration.Visible = $true
+            $btnCancelMigration.Enabled = $true
+            $btnCancelMigration.Text = "Cancel"
             $listFolders.Enabled = $false
             $resultsPanel.Visible = $false
             $btnOpenFolder.Visible = $false
@@ -2092,7 +2638,7 @@ function Show-FilesPage {
             }
 
             $clientName = $env:COMPUTERNAME
-            $result = Start-FilesMigration -ClientName $clientName -OutputFolder $txtSaveLocation.Text -SelectedFolders $selected -Mode $mode -SelectedBrowsers $browsers -OnProgress $progressCallback
+            $result = Start-FilesMigration -ClientName $clientName -OutputFolder $txtSaveLocation.Text -SelectedFolders $selected -Mode $mode -SelectedBrowsers $browsers -PrecomputedSizes $script:FilesFolderSizes -OnProgress $progressCallback
 
             # Show results
             $progressPanel.Visible = $false
@@ -2123,8 +2669,10 @@ function Show-FilesPage {
             $progressPanel.Visible = $false
         } finally {
             $script:OperationInProgress = $false
+            $script:CancelRequested = $false
             $btnStartMigration.Enabled = $true
             $btnStartMigration.Text = "Start Migration"
+            $btnCancelMigration.Visible = $false
             $listFolders.Enabled = $true
         }
     }.GetNewClosure())
@@ -2136,11 +2684,11 @@ function Show-FilesPage {
         $lblBrowsers, $chkChrome, $chkFirefox, $chkEdge,
         $lblMode, $rdoZip, $rdoDirect,
         $lblSave, $txtSaveLocation, $btnBrowseSave,
-        $btnStartMigration,
+        $btnStartMigration, $btnCancelMigration,
         $progressPanel, $resultsPanel
     ))
 
-    # Async folder size calculation
+    # Folder size calculation (updates UI incrementally via DoEvents)
     $sizeCallback = {
         param($folderName, $sizeBytes, $fileCount)
         $script:FilesFolderSizes[$folderName] = $sizeBytes
@@ -2163,9 +2711,854 @@ function Show-FilesPage {
     $null = Get-FolderSizes -FolderNames $folderNames -OnProgress $sizeCallback
 }
 
+function Show-TransferPage {
+    if ($script:OperationInProgress) { return }
+    Clear-ContentPanel
+    Set-ActiveSidebarButton -Page "Transfer"
+    Update-StatusBar "Remote Transfer"
+
+    $accentColor = $script:Colors.AccentPink
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Remote Transfer"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $accentColor
+    $title.Location = New-Object System.Drawing.Point(20, 15)
+    $title.AutoSize = $true
+
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = "Transfer files between PCs over your local network"
+    $subtitle.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $subtitle.ForeColor = $script:Colors.TextSecondary
+    $subtitle.Location = New-Object System.Drawing.Point(20, 50)
+    $subtitle.AutoSize = $true
+
+    # --- CARD 1: Send (HTTP Server) ---
+    $card1 = New-Object System.Windows.Forms.GroupBox
+    $card1.Text = "Send (HTTP Server)"
+    $card1.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $card1.ForeColor = $accentColor
+    $card1.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card1.Location = New-Object System.Drawing.Point(20, 80)
+    $card1.Size = New-Object System.Drawing.Size(360, 130)
+
+    $txtServerFolder = New-Object System.Windows.Forms.TextBox
+    $txtServerFolder.Location = New-Object System.Drawing.Point(10, 25)
+    $txtServerFolder.Size = New-Object System.Drawing.Size(250, 24)
+    $txtServerFolder.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtServerFolder.BackColor = $script:Colors.InputBg
+    $txtServerFolder.ForeColor = $script:Colors.TextPrimary
+    $txtServerFolder.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $btnBrowseServer = New-StyledButton -Text "..." -Width 40 -Height 24 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseServer.Location = New-Object System.Drawing.Point(265, 25)
+    $btnBrowseServer.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select folder to serve"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtServerFolder.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $lblServerUrl = New-Object System.Windows.Forms.Label
+    $lblServerUrl.Text = "URL will appear here"
+    $lblServerUrl.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblServerUrl.ForeColor = $script:Colors.TextSecondary
+    $lblServerUrl.Location = New-Object System.Drawing.Point(10, 58)
+    $lblServerUrl.Size = New-Object System.Drawing.Size(340, 20)
+
+    $btnStartServer = New-StyledButton -Text "Start Server" -Width 120 -Height 30 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnStartServer.Location = New-Object System.Drawing.Point(10, 85)
+
+    $btnStopServer = New-StyledButton -Text "Stop" -Width 80 -Height 30 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnStopServer.Location = New-Object System.Drawing.Point(140, 85)
+    $btnStopServer.Visible = $false
+
+    $card1.Controls.AddRange(@($txtServerFolder, $btnBrowseServer, $lblServerUrl, $btnStartServer, $btnStopServer))
+
+    # --- CARD 2: Send (Direct TCP) ---
+    $card2 = New-Object System.Windows.Forms.GroupBox
+    $card2.Text = "Send (Direct TCP)"
+    $card2.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $card2.ForeColor = $accentColor
+    $card2.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card2.Location = New-Object System.Drawing.Point(400, 80)
+    $card2.Size = New-Object System.Drawing.Size(360, 130)
+
+    $txtTcpFolder = New-Object System.Windows.Forms.TextBox
+    $txtTcpFolder.Location = New-Object System.Drawing.Point(10, 25)
+    $txtTcpFolder.Size = New-Object System.Drawing.Size(250, 24)
+    $txtTcpFolder.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtTcpFolder.BackColor = $script:Colors.InputBg
+    $txtTcpFolder.ForeColor = $script:Colors.TextPrimary
+    $txtTcpFolder.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $btnBrowseTcp = New-StyledButton -Text "..." -Width 40 -Height 24 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseTcp.Location = New-Object System.Drawing.Point(265, 25)
+    $btnBrowseTcp.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select folder to send"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtTcpFolder.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $lblTcpInfo = New-Object System.Windows.Forms.Label
+    $lblTcpInfo.Text = "Receiver must connect to your IP"
+    $lblTcpInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblTcpInfo.ForeColor = $script:Colors.TextSecondary
+    $lblTcpInfo.Location = New-Object System.Drawing.Point(10, 58)
+    $lblTcpInfo.Size = New-Object System.Drawing.Size(340, 20)
+
+    $btnStartTcp = New-StyledButton -Text "Start Sender" -Width 120 -Height 30 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnStartTcp.Location = New-Object System.Drawing.Point(10, 85)
+
+    $card2.Controls.AddRange(@($txtTcpFolder, $btnBrowseTcp, $lblTcpInfo, $btnStartTcp))
+
+    # --- CARD 3: Receive ---
+    $card3 = New-Object System.Windows.Forms.GroupBox
+    $card3.Text = "Receive"
+    $card3.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $card3.ForeColor = $accentColor
+    $card3.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card3.Location = New-Object System.Drawing.Point(20, 220)
+    $card3.Size = New-Object System.Drawing.Size(360, 130)
+
+    $lblIP = New-Object System.Windows.Forms.Label
+    $lblIP.Text = "Sender IP:"
+    $lblIP.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblIP.ForeColor = $script:Colors.TextPrimary
+    $lblIP.Location = New-Object System.Drawing.Point(10, 25)
+    $lblIP.AutoSize = $true
+
+    $txtRemoteIP = New-Object System.Windows.Forms.TextBox
+    $txtRemoteIP.Location = New-Object System.Drawing.Point(80, 23)
+    $txtRemoteIP.Size = New-Object System.Drawing.Size(150, 24)
+    $txtRemoteIP.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtRemoteIP.BackColor = $script:Colors.InputBg
+    $txtRemoteIP.ForeColor = $script:Colors.TextPrimary
+    $txtRemoteIP.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $lblSaveRecv = New-Object System.Windows.Forms.Label
+    $lblSaveRecv.Text = "Save to:"
+    $lblSaveRecv.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblSaveRecv.ForeColor = $script:Colors.TextPrimary
+    $lblSaveRecv.Location = New-Object System.Drawing.Point(10, 55)
+    $lblSaveRecv.AutoSize = $true
+
+    $txtRecvFolder = New-Object System.Windows.Forms.TextBox
+    $txtRecvFolder.Location = New-Object System.Drawing.Point(80, 53)
+    $txtRecvFolder.Size = New-Object System.Drawing.Size(200, 24)
+    $txtRecvFolder.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtRecvFolder.BackColor = $script:Colors.InputBg
+    $txtRecvFolder.ForeColor = $script:Colors.TextPrimary
+    $txtRecvFolder.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $btnBrowseRecv = New-StyledButton -Text "..." -Width 40 -Height 24 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseRecv.Location = New-Object System.Drawing.Point(285, 53)
+    $btnBrowseRecv.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Choose where to save received files"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtRecvFolder.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $btnDownloadHttp = New-StyledButton -Text "Download (HTTP)" -Width 140 -Height 30 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnDownloadHttp.Location = New-Object System.Drawing.Point(10, 88)
+
+    $btnReceiveTcp = New-StyledButton -Text "Receive (TCP)" -Width 130 -Height 30 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnReceiveTcp.Location = New-Object System.Drawing.Point(160, 88)
+
+    $card3.Controls.AddRange(@($lblIP, $txtRemoteIP, $lblSaveRecv, $txtRecvFolder, $btnBrowseRecv, $btnDownloadHttp, $btnReceiveTcp))
+
+    # --- CARD 4: Shared Folder ---
+    $card4 = New-Object System.Windows.Forms.GroupBox
+    $card4.Text = "Shared Folder"
+    $card4.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $card4.ForeColor = $accentColor
+    $card4.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card4.Location = New-Object System.Drawing.Point(400, 220)
+    $card4.Size = New-Object System.Drawing.Size(360, 130)
+
+    $lblShareSrc = New-Object System.Windows.Forms.Label
+    $lblShareSrc.Text = "Source:"
+    $lblShareSrc.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblShareSrc.ForeColor = $script:Colors.TextPrimary
+    $lblShareSrc.Location = New-Object System.Drawing.Point(10, 25)
+    $lblShareSrc.AutoSize = $true
+
+    $txtShareSrc = New-Object System.Windows.Forms.TextBox
+    $txtShareSrc.Location = New-Object System.Drawing.Point(70, 23)
+    $txtShareSrc.Size = New-Object System.Drawing.Size(210, 24)
+    $txtShareSrc.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtShareSrc.BackColor = $script:Colors.InputBg
+    $txtShareSrc.ForeColor = $script:Colors.TextPrimary
+    $txtShareSrc.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $btnBrowseShareSrc = New-StyledButton -Text "..." -Width 40 -Height 24 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseShareSrc.Location = New-Object System.Drawing.Point(285, 23)
+    $btnBrowseShareSrc.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select source folder"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtShareSrc.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $lblShareDest = New-Object System.Windows.Forms.Label
+    $lblShareDest.Text = "UNC Dest:"
+    $lblShareDest.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblShareDest.ForeColor = $script:Colors.TextPrimary
+    $lblShareDest.Location = New-Object System.Drawing.Point(10, 55)
+    $lblShareDest.AutoSize = $true
+
+    $txtShareDest = New-Object System.Windows.Forms.TextBox
+    $txtShareDest.Location = New-Object System.Drawing.Point(70, 53)
+    $txtShareDest.Size = New-Object System.Drawing.Size(210, 24)
+    $txtShareDest.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $txtShareDest.BackColor = $script:Colors.InputBg
+    $txtShareDest.ForeColor = $script:Colors.TextPrimary
+    $txtShareDest.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $txtShareDest.Text = "\\PC-NAME\Share"
+
+    $btnBrowseShareDest = New-StyledButton -Text "..." -Width 40 -Height 24 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseShareDest.Location = New-Object System.Drawing.Point(285, 53)
+    $btnBrowseShareDest.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select UNC destination"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtShareDest.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $btnCopyShare = New-StyledButton -Text "Copy" -Width 120 -Height 30 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnCopyShare.Location = New-Object System.Drawing.Point(10, 88)
+
+    $card4.Controls.AddRange(@($lblShareSrc, $txtShareSrc, $btnBrowseShareSrc, $lblShareDest, $txtShareDest, $btnBrowseShareDest, $btnCopyShare))
+
+    # --- Status Panel ---
+    $statusGroup = New-Object System.Windows.Forms.GroupBox
+    $statusGroup.Text = "Transfer Status"
+    $statusGroup.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $statusGroup.ForeColor = $script:Colors.TextSecondary
+    $statusGroup.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $statusGroup.Location = New-Object System.Drawing.Point(20, 360)
+    $statusGroup.Size = New-Object System.Drawing.Size(740, 150)
+
+    $txtTransferLog = New-Object System.Windows.Forms.TextBox
+    $txtTransferLog.Location = New-Object System.Drawing.Point(10, 22)
+    $txtTransferLog.Size = New-Object System.Drawing.Size(610, 80)
+    $txtTransferLog.Font = New-Object System.Drawing.Font("Consolas", 9)
+    $txtTransferLog.BackColor = $script:Colors.InputBg
+    $txtTransferLog.ForeColor = $script:Colors.TextSecondary
+    $txtTransferLog.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $txtTransferLog.Multiline = $true
+    $txtTransferLog.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
+    $txtTransferLog.ReadOnly = $true
+
+    $transferProgress = New-Object System.Windows.Forms.ProgressBar
+    $transferProgress.Location = New-Object System.Drawing.Point(10, 110)
+    $transferProgress.Size = New-Object System.Drawing.Size(610, 20)
+    $transferProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+
+    $btnStopTransfer = New-StyledButton -Text "Stop" -Width 90 -Height 35 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
+    $btnStopTransfer.Location = New-Object System.Drawing.Point(635, 22)
+    $btnStopTransfer.Enabled = $false
+
+    $statusGroup.Controls.AddRange(@($txtTransferLog, $transferProgress, $btnStopTransfer))
+
+    # --- Helper: log to transfer panel ---
+    $logTransfer = {
+        param([string]$Message)
+        $txtTransferLog.AppendText("$Message`r`n")
+        $txtTransferLog.SelectionStart = $txtTransferLog.TextLength
+        $txtTransferLog.ScrollToCaret()
+        Update-GuiStatus
+    }.GetNewClosure()
+
+    # --- Event Handlers ---
+    $btnStopTransfer.Add_Click({
+        $script:CancelRequested = $true
+        Stop-TransferServer
+        $btnStopTransfer.Enabled = $false
+        & $logTransfer "Transfer stopped by user."
+    }.GetNewClosure())
+
+    $btnStartServer.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtServerFolder.Text)) { throw "Select a folder to serve." }
+            if (-not (Test-Path $txtServerFolder.Text)) { throw "Folder not found." }
+
+            $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnStartServer.Enabled = $false
+            $btnStopServer.Visible = $true
+            $btnStopTransfer.Enabled = $true
+            $txtTransferLog.Clear()
+            & $logTransfer "Starting HTTP server..."
+
+            $serverProgress = {
+                param($phase, $current, $total, $status)
+                & $logTransfer $status
+                if ($total -gt 0) {
+                    $transferProgress.Maximum = $total
+                    $transferProgress.Value = [Math]::Min($current, $total)
+                }
+            }.GetNewClosure()
+
+            $localIP = Get-PrimaryLocalIP
+            $url = "http://${localIP}:8642/"
+            $lblServerUrl.Text = $url
+            $lblServerUrl.ForeColor = $script:Colors.AccentGreen
+            & $logTransfer "Server running at $url"
+            & $logTransfer "Open this URL on the other PC to download files."
+
+            Start-TransferServer -SourceFolder $txtServerFolder.Text -Port 8642 -OnProgress $serverProgress
+
+        } catch {
+            & $logTransfer "Error: $($_.Exception.Message)"
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        } finally {
+            $script:OperationInProgress = $false
+            $btnStartServer.Enabled = $true
+            $btnStopServer.Visible = $false
+            $btnStopTransfer.Enabled = $false
+            $lblServerUrl.Text = "Server stopped"
+            $lblServerUrl.ForeColor = $script:Colors.TextSecondary
+        }
+    }.GetNewClosure())
+
+    $btnStopServer.Add_Click({
+        Stop-TransferServer
+        $btnStopServer.Visible = $false
+        $btnStartServer.Enabled = $true
+        $lblServerUrl.Text = "Server stopped"
+        $lblServerUrl.ForeColor = $script:Colors.TextSecondary
+    }.GetNewClosure())
+
+    $btnStartTcp.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtTcpFolder.Text)) { throw "Select a folder to send." }
+            if (-not (Test-Path $txtTcpFolder.Text)) { throw "Folder not found." }
+
+            $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnStartTcp.Enabled = $false
+            $btnStopTransfer.Enabled = $true
+            $txtTransferLog.Clear()
+            & $logTransfer "Starting TCP sender..."
+
+            $tcpProgress = {
+                param($phase, $current, $total, $status)
+                & $logTransfer $status
+                if ($total -gt 0) {
+                    $transferProgress.Maximum = 100
+                    $transferProgress.Value = [Math]::Min([Math]::Round(($current / $total) * 100), 100)
+                }
+            }.GetNewClosure()
+
+            $result = Start-DirectSend -SourceFolder $txtTcpFolder.Text -Port 8643 -OnProgress $tcpProgress
+            if ($result.Success) {
+                & $logTransfer "Send complete: $($result.FilesSent) files, $(Format-FileSize $result.BytesSent)"
+            } else {
+                & $logTransfer "Send failed: $($result.Errors -join '; ')"
+            }
+        } catch {
+            & $logTransfer "Error: $($_.Exception.Message)"
+        } finally {
+            $script:OperationInProgress = $false
+            $btnStartTcp.Enabled = $true
+            $btnStopTransfer.Enabled = $false
+        }
+    }.GetNewClosure())
+
+    $btnDownloadHttp.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtRemoteIP.Text)) { throw "Enter the sender's IP address." }
+            if ([string]::IsNullOrWhiteSpace($txtRecvFolder.Text)) { throw "Select a save folder." }
+
+            $script:OperationInProgress = $true
+            $btnDownloadHttp.Enabled = $false
+            $btnStopTransfer.Enabled = $true
+            $txtTransferLog.Clear()
+            & $logTransfer "Downloading from HTTP server..."
+
+            $httpRecvProgress = {
+                param($phase, $current, $total, $status)
+                & $logTransfer $status
+            }.GetNewClosure()
+
+            $url = "http://$($txtRemoteIP.Text):8642/"
+            $result = Get-TransferFromServer -ServerUrl $url -OutputFolder $txtRecvFolder.Text -OnProgress $httpRecvProgress
+            if ($result.Success) {
+                & $logTransfer "Download complete! Saved to: $($result.Path)"
+            } else {
+                & $logTransfer "Download failed: $($result.Errors -join '; ')"
+            }
+        } catch {
+            & $logTransfer "Error: $($_.Exception.Message)"
+        } finally {
+            $script:OperationInProgress = $false
+            $btnDownloadHttp.Enabled = $true
+            $btnStopTransfer.Enabled = $false
+        }
+    }.GetNewClosure())
+
+    $btnReceiveTcp.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtRemoteIP.Text)) { throw "Enter the sender's IP address." }
+            if ([string]::IsNullOrWhiteSpace($txtRecvFolder.Text)) { throw "Select a save folder." }
+
+            $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnReceiveTcp.Enabled = $false
+            $btnStopTransfer.Enabled = $true
+            $txtTransferLog.Clear()
+            & $logTransfer "Connecting to TCP sender..."
+
+            $tcpRecvProgress = {
+                param($phase, $current, $total, $status)
+                & $logTransfer $status
+                if ($total -gt 0) {
+                    $transferProgress.Maximum = 100
+                    $transferProgress.Value = [Math]::Min([Math]::Round(($current / $total) * 100), 100)
+                }
+            }.GetNewClosure()
+
+            $result = Start-DirectReceive -RemoteIP $txtRemoteIP.Text -OutputFolder $txtRecvFolder.Text -Port 8643 -OnProgress $tcpRecvProgress
+            if ($result.Success) {
+                & $logTransfer "Receive complete: $($result.FilesReceived) files"
+            } else {
+                & $logTransfer "Receive had errors: $($result.Errors -join '; ')"
+            }
+        } catch {
+            & $logTransfer "Error: $($_.Exception.Message)"
+        } finally {
+            $script:OperationInProgress = $false
+            $btnReceiveTcp.Enabled = $true
+            $btnStopTransfer.Enabled = $false
+        }
+    }.GetNewClosure())
+
+    $btnCopyShare.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtShareSrc.Text)) { throw "Enter source folder." }
+            if ([string]::IsNullOrWhiteSpace($txtShareDest.Text)) { throw "Enter UNC destination." }
+
+            $script:OperationInProgress = $true
+            $btnCopyShare.Enabled = $false
+            $txtTransferLog.Clear()
+            & $logTransfer "Copying to shared folder..."
+
+            $shareProgress = {
+                param($phase, $current, $total, $status)
+                & $logTransfer $status
+                if ($total -gt 0) {
+                    $transferProgress.Maximum = 100
+                    $transferProgress.Value = [Math]::Min([Math]::Round(($current / $total) * 100), 100)
+                }
+            }.GetNewClosure()
+
+            $result = Export-ToSharedFolder -SourceFolder $txtShareSrc.Text -DestinationUNC $txtShareDest.Text -OnProgress $shareProgress
+            if ($result.Success) {
+                & $logTransfer "Copy complete: $($result.TotalFiles) files, $(Format-FileSize $result.TotalBytes)"
+            } else {
+                & $logTransfer "Copy failed: $($result.Errors -join '; ')"
+            }
+        } catch {
+            & $logTransfer "Error: $($_.Exception.Message)"
+        } finally {
+            $script:OperationInProgress = $false
+            $btnCopyShare.Enabled = $true
+        }
+    }.GetNewClosure())
+
+    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $card1, $card2, $card3, $card4, $statusGroup))
+}
+
+function Show-RestorePage {
+    if ($script:OperationInProgress) { return }
+    Clear-ContentPanel
+    Set-ActiveSidebarButton -Page "Restore"
+    Update-StatusBar "Restore Bundle"
+
+    $accentColor = $script:Colors.AccentLightBlue
+
+    $title = New-Object System.Windows.Forms.Label
+    $title.Text = "Restore Bundle"
+    $title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
+    $title.ForeColor = $accentColor
+    $title.Location = New-Object System.Drawing.Point(20, 15)
+    $title.AutoSize = $true
+
+    $subtitle = New-Object System.Windows.Forms.Label
+    $subtitle.Text = "Detect and restore a migration bundle to this PC"
+    $subtitle.Font = New-Object System.Drawing.Font("Segoe UI", 10)
+    $subtitle.ForeColor = $script:Colors.TextSecondary
+    $subtitle.Location = New-Object System.Drawing.Point(20, 50)
+    $subtitle.AutoSize = $true
+
+    # --- Browse + Detect ---
+    $txtBundlePath = New-Object System.Windows.Forms.TextBox
+    $txtBundlePath.Location = New-Object System.Drawing.Point(20, 80)
+    $txtBundlePath.Size = New-Object System.Drawing.Size(530, 28)
+    $txtBundlePath.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+    $txtBundlePath.BackColor = $script:Colors.InputBg
+    $txtBundlePath.ForeColor = $script:Colors.TextPrimary
+    $txtBundlePath.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+
+    $btnBrowseBundle = New-StyledButton -Text "Browse" -Width 80 -Height 28 -BackColor $script:Colors.ButtonBg -ForeColor $script:Colors.TextPrimary
+    $btnBrowseBundle.Location = New-Object System.Drawing.Point(560, 80)
+    $btnBrowseBundle.Add_Click({
+        $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
+        $dlg.Description = "Select bundle folder"
+        if ($dlg.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) { $txtBundlePath.Text = $dlg.SelectedPath }
+        $dlg.Dispose()
+    }.GetNewClosure())
+
+    $btnDetect = New-StyledButton -Text "Detect" -Width 80 -Height 28 -BackColor $accentColor -ForeColor $script:Colors.TextPrimary
+    $btnDetect.Location = New-Object System.Drawing.Point(650, 80)
+
+    # --- Detection Results Panel (hidden until detect) ---
+    $resultsPanel = New-Object System.Windows.Forms.Panel
+    $resultsPanel.Location = New-Object System.Drawing.Point(20, 120)
+    $resultsPanel.Size = New-Object System.Drawing.Size(740, 300)
+    $resultsPanel.BackColor = $script:Colors.ContentBg
+    $resultsPanel.Visible = $false
+
+    # Source PC info
+    $lblSourceInfo = New-Object System.Windows.Forms.Label
+    $lblSourceInfo.Text = ""
+    $lblSourceInfo.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $lblSourceInfo.ForeColor = $script:Colors.TextPrimary
+    $lblSourceInfo.Location = New-Object System.Drawing.Point(0, 0)
+    $lblSourceInfo.Size = New-Object System.Drawing.Size(740, 25)
+
+    # Programs card
+    $chkPrograms = New-Object System.Windows.Forms.CheckBox
+    $chkPrograms.Text = "Programs"
+    $chkPrograms.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $chkPrograms.ForeColor = $script:Colors.AccentGreen
+    $chkPrograms.BackColor = $script:Colors.ContentBg
+    $chkPrograms.Location = New-Object System.Drawing.Point(0, 35)
+    $chkPrograms.AutoSize = $true
+    $chkPrograms.Enabled = $false
+
+    $lblProgramsInfo = New-Object System.Windows.Forms.Label
+    $lblProgramsInfo.Text = ""
+    $lblProgramsInfo.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblProgramsInfo.ForeColor = $script:Colors.TextSecondary
+    $lblProgramsInfo.Location = New-Object System.Drawing.Point(20, 58)
+    $lblProgramsInfo.Size = New-Object System.Drawing.Size(350, 18)
+
+    # Files card - checkboxes per folder
+    $lblFilesHeader = New-Object System.Windows.Forms.Label
+    $lblFilesHeader.Text = "FILES"
+    $lblFilesHeader.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $lblFilesHeader.ForeColor = $script:Colors.AccentOrange
+    $lblFilesHeader.Location = New-Object System.Drawing.Point(0, 85)
+    $lblFilesHeader.AutoSize = $true
+
+    $listFileFolders = New-Object System.Windows.Forms.CheckedListBox
+    $listFileFolders.Location = New-Object System.Drawing.Point(0, 105)
+    $listFileFolders.Size = New-Object System.Drawing.Size(350, 85)
+    $listFileFolders.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $listFileFolders.BackColor = $script:Colors.InputBg
+    $listFileFolders.ForeColor = $script:Colors.TextPrimary
+    $listFileFolders.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $listFileFolders.CheckOnClick = $true
+    $listFileFolders.Enabled = $false
+
+    # System card
+    $lblSystemHeader = New-Object System.Windows.Forms.Label
+    $lblSystemHeader.Text = "SYSTEM SETTINGS"
+    $lblSystemHeader.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $lblSystemHeader.ForeColor = $accentColor
+    $lblSystemHeader.Location = New-Object System.Drawing.Point(380, 85)
+    $lblSystemHeader.AutoSize = $true
+
+    $listSystemItems = New-Object System.Windows.Forms.CheckedListBox
+    $listSystemItems.Location = New-Object System.Drawing.Point(380, 105)
+    $listSystemItems.Size = New-Object System.Drawing.Size(350, 85)
+    $listSystemItems.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $listSystemItems.BackColor = $script:Colors.InputBg
+    $listSystemItems.ForeColor = $script:Colors.TextPrimary
+    $listSystemItems.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $listSystemItems.CheckOnClick = $true
+    $listSystemItems.Enabled = $false
+
+    # Bookmarks card
+    $lblBookmarksHeader = New-Object System.Windows.Forms.Label
+    $lblBookmarksHeader.Text = "BOOKMARKS (close browsers before restoring)"
+    $lblBookmarksHeader.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+    $lblBookmarksHeader.ForeColor = $script:Colors.AccentOrange
+    $lblBookmarksHeader.Location = New-Object System.Drawing.Point(0, 200)
+    $lblBookmarksHeader.AutoSize = $true
+
+    $chkRestoreChrome = New-Object System.Windows.Forms.CheckBox
+    $chkRestoreChrome.Text = "Chrome"
+    $chkRestoreChrome.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $chkRestoreChrome.ForeColor = $script:Colors.TextPrimary
+    $chkRestoreChrome.BackColor = $script:Colors.ContentBg
+    $chkRestoreChrome.Location = New-Object System.Drawing.Point(0, 222)
+    $chkRestoreChrome.AutoSize = $true
+    $chkRestoreChrome.Enabled = $false
+
+    $chkRestoreFirefox = New-Object System.Windows.Forms.CheckBox
+    $chkRestoreFirefox.Text = "Firefox"
+    $chkRestoreFirefox.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $chkRestoreFirefox.ForeColor = $script:Colors.TextPrimary
+    $chkRestoreFirefox.BackColor = $script:Colors.ContentBg
+    $chkRestoreFirefox.Location = New-Object System.Drawing.Point(100, 222)
+    $chkRestoreFirefox.AutoSize = $true
+    $chkRestoreFirefox.Enabled = $false
+
+    $chkRestoreEdge = New-Object System.Windows.Forms.CheckBox
+    $chkRestoreEdge.Text = "Edge"
+    $chkRestoreEdge.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $chkRestoreEdge.ForeColor = $script:Colors.TextPrimary
+    $chkRestoreEdge.BackColor = $script:Colors.ContentBg
+    $chkRestoreEdge.Location = New-Object System.Drawing.Point(200, 222)
+    $chkRestoreEdge.AutoSize = $true
+    $chkRestoreEdge.Enabled = $false
+
+    # Restore button
+    $btnRestore = New-StyledButton -Text "Restore Selected" -Width 200 -Height 40 -BackColor $accentColor -ForeColor $script:Colors.TextDark
+    $btnRestore.Font = New-Object System.Drawing.Font("Segoe UI", 11, [System.Drawing.FontStyle]::Bold)
+    $btnRestore.Location = New-Object System.Drawing.Point(0, 255)
+    $btnRestore.Enabled = $false
+
+    $resultsPanel.Controls.AddRange(@(
+        $lblSourceInfo, $chkPrograms, $lblProgramsInfo,
+        $lblFilesHeader, $listFileFolders,
+        $lblSystemHeader, $listSystemItems,
+        $lblBookmarksHeader, $chkRestoreChrome, $chkRestoreFirefox, $chkRestoreEdge,
+        $btnRestore
+    ))
+
+    # --- Progress area ---
+    $restoreProgressPanel = New-Object System.Windows.Forms.Panel
+    $restoreProgressPanel.Location = New-Object System.Drawing.Point(20, 430)
+    $restoreProgressPanel.Size = New-Object System.Drawing.Size(740, 80)
+    $restoreProgressPanel.BackColor = $script:Colors.ContentBg
+    $restoreProgressPanel.Visible = $false
+
+    $lblPhase = New-Object System.Windows.Forms.Label
+    $lblPhase.Text = ""
+    $lblPhase.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
+    $lblPhase.ForeColor = $accentColor
+    $lblPhase.Location = New-Object System.Drawing.Point(0, 0)
+    $lblPhase.Size = New-Object System.Drawing.Size(740, 20)
+
+    $restoreBar = New-Object System.Windows.Forms.ProgressBar
+    $restoreBar.Location = New-Object System.Drawing.Point(0, 25)
+    $restoreBar.Size = New-Object System.Drawing.Size(740, 18)
+    $restoreBar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+
+    $lblRestoreStatus = New-Object System.Windows.Forms.Label
+    $lblRestoreStatus.Text = ""
+    $lblRestoreStatus.Font = New-Object System.Drawing.Font("Segoe UI", 9)
+    $lblRestoreStatus.ForeColor = $script:Colors.TextSecondary
+    $lblRestoreStatus.Location = New-Object System.Drawing.Point(0, 50)
+    $lblRestoreStatus.Size = New-Object System.Drawing.Size(740, 18)
+
+    $restoreProgressPanel.Controls.AddRange(@($lblPhase, $restoreBar, $lblRestoreStatus))
+
+    # Store bundle contents for restore
+    $script:RestoreBundleContents = $null
+
+    # --- Detect handler ---
+    $btnDetect.Add_Click({
+        try {
+            if ([string]::IsNullOrWhiteSpace($txtBundlePath.Text)) { throw "Select a bundle path." }
+            if (-not (Test-Path $txtBundlePath.Text)) { throw "Path not found." }
+
+            $btnDetect.Enabled = $false
+            $btnDetect.Text = "..."
+            Update-GuiStatus
+
+            $script:RestoreBundleContents = Find-BundleContents -Path $txtBundlePath.Text
+
+            $bc = $script:RestoreBundleContents
+            $resultsPanel.Visible = $true
+            $restoreProgressPanel.Visible = $false
+
+            # Source info
+            $infoText = ""
+            if ($bc.Meta.SourcePC) { $infoText += "Source PC: $($bc.Meta.SourcePC)" }
+            if ($bc.Meta.Date) {
+                try { $d = [DateTime]::Parse($bc.Meta.Date); $infoText += " | Date: $($d.ToString('yyyy-MM-dd HH:mm'))" } catch { $infoText += " | Date: $($bc.Meta.Date)" }
+            }
+            $lblSourceInfo.Text = $infoText
+
+            # Programs
+            if ($bc.Programs.Found) {
+                $chkPrograms.Enabled = $true
+                $chkPrograms.Checked = $true
+                $chkPrograms.Text = "Programs ($($bc.Programs.Count) found)"
+                $lblProgramsInfo.Text = "Will install via winget/chocolatey"
+            } else {
+                $chkPrograms.Enabled = $false
+                $chkPrograms.Checked = $false
+                $chkPrograms.Text = "Programs (not found)"
+                $lblProgramsInfo.Text = ""
+            }
+
+            # Files
+            $listFileFolders.Items.Clear()
+            if ($bc.Files.Found -and $bc.Files.Folders.Count -gt 0) {
+                $listFileFolders.Enabled = $true
+                foreach ($f in $bc.Files.Folders) {
+                    $sizeStr = Format-FileSize $f.SizeBytes
+                    [void]$listFileFolders.Items.Add("$($f.Name) ($sizeStr)", $true)
+                }
+            } else {
+                $listFileFolders.Enabled = $false
+            }
+
+            # System
+            $listSystemItems.Items.Clear()
+            if ($bc.System.Found -and $bc.System.Items.Count -gt 0) {
+                $listSystemItems.Enabled = $true
+                foreach ($item in $bc.System.Items) {
+                    [void]$listSystemItems.Items.Add($item, $true)
+                }
+            } else {
+                $listSystemItems.Enabled = $false
+            }
+
+            # Bookmarks
+            $chkRestoreChrome.Enabled = $false; $chkRestoreChrome.Checked = $false
+            $chkRestoreFirefox.Enabled = $false; $chkRestoreFirefox.Checked = $false
+            $chkRestoreEdge.Enabled = $false; $chkRestoreEdge.Checked = $false
+            if ($bc.Bookmarks.Found) {
+                foreach ($b in $bc.Bookmarks.Browsers) {
+                    switch ($b) {
+                        'Chrome' { $chkRestoreChrome.Enabled = $true; $chkRestoreChrome.Checked = $true }
+                        'Firefox' { $chkRestoreFirefox.Enabled = $true; $chkRestoreFirefox.Checked = $true }
+                        'Edge' { $chkRestoreEdge.Enabled = $true; $chkRestoreEdge.Checked = $true }
+                    }
+                }
+            }
+
+            # Enable restore button if anything found
+            $hasAnything = $bc.Programs.Found -or $bc.Files.Found -or $bc.System.Found -or $bc.Bookmarks.Found
+            $btnRestore.Enabled = $hasAnything
+
+            Write-Log "Bundle detected: Programs=$($bc.Programs.Found) Files=$($bc.Files.Found) System=$($bc.System.Found) Bookmarks=$($bc.Bookmarks.Found)"
+            Update-StatusBar "Bundle detected - ready to restore"
+
+        } catch {
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        } finally {
+            $btnDetect.Enabled = $true
+            $btnDetect.Text = "Detect"
+        }
+    }.GetNewClosure())
+
+    # --- Restore handler ---
+    $btnRestore.Add_Click({
+        try {
+            $bc = $script:RestoreBundleContents
+            if (-not $bc) { throw "Run Detect first." }
+
+            # Build selections
+            $selections = @{}
+
+            if ($chkPrograms.Checked -and $chkPrograms.Enabled) {
+                $selections['Programs'] = $true
+            }
+
+            $selectedFolders = @()
+            if ($bc.Files.Found) {
+                for ($i = 0; $i -lt $listFileFolders.Items.Count; $i++) {
+                    if ($listFileFolders.GetItemChecked($i)) {
+                        $folderName = $bc.Files.Folders[$i].Name
+                        $selectedFolders += $folderName
+                    }
+                }
+            }
+            if ($selectedFolders.Count -gt 0) { $selections['Files'] = $selectedFolders }
+
+            $selectedSystem = @()
+            for ($i = 0; $i -lt $listSystemItems.Items.Count; $i++) {
+                if ($listSystemItems.GetItemChecked($i)) {
+                    $selectedSystem += [string]$listSystemItems.Items[$i]
+                }
+            }
+            if ($selectedSystem.Count -gt 0) { $selections['System'] = $selectedSystem }
+
+            $selectedBrowsers = @()
+            if ($chkRestoreChrome.Checked -and $chkRestoreChrome.Enabled) { $selectedBrowsers += 'Chrome' }
+            if ($chkRestoreFirefox.Checked -and $chkRestoreFirefox.Enabled) { $selectedBrowsers += 'Firefox' }
+            if ($chkRestoreEdge.Checked -and $chkRestoreEdge.Enabled) { $selectedBrowsers += 'Edge' }
+            if ($selectedBrowsers.Count -gt 0) { $selections['Bookmarks'] = $selectedBrowsers }
+
+            if ($selections.Count -eq 0) { throw "Nothing selected to restore." }
+
+            # Confirmation
+            $msg = "Restore the following?`n"
+            if ($selections.ContainsKey('Programs')) { $msg += "`n- Programs ($($bc.Programs.Count) apps)" }
+            if ($selections.ContainsKey('Files')) { $msg += "`n- Files ($($selectedFolders.Count) folders)" }
+            if ($selections.ContainsKey('System')) { $msg += "`n- System ($($selectedSystem.Count) items)" }
+            if ($selections.ContainsKey('Bookmarks')) { $msg += "`n- Bookmarks ($($selectedBrowsers -join ', '))" }
+
+            $confirm = [System.Windows.Forms.MessageBox]::Show($msg, "Confirm Restore", [System.Windows.Forms.MessageBoxButtons]::YesNo, [System.Windows.Forms.MessageBoxIcon]::Question)
+            if ($confirm -ne [System.Windows.Forms.DialogResult]::Yes) { return }
+
+            $script:OperationInProgress = $true
+            $script:CancelRequested = $false
+            $btnRestore.Enabled = $false
+            $btnRestore.Text = "Restoring..."
+            $restoreProgressPanel.Visible = $true
+
+            $phaseCallback = {
+                param($phase, $message)
+                $lblPhase.Text = "$phase - $message"
+                Update-GuiStatus
+            }.GetNewClosure()
+
+            $progressCallback = {
+                param($name, $current, $total, $status)
+                $lblRestoreStatus.Text = "$name - $status"
+                Update-GuiStatus
+            }.GetNewClosure()
+
+            $result = Start-FullRestore -BundlePath $txtBundlePath.Text -BundleContents $bc -Selections $selections -OnPhaseChange $phaseCallback -OnProgress $progressCallback
+
+            # Show results
+            $restoreBar.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+            $restoreBar.Value = 100
+
+            $summary = "Restore complete!"
+            if ($result.Errors.Count -gt 0) {
+                $summary += " ($($result.Errors.Count) error(s))"
+                $lblPhase.ForeColor = $script:Colors.AccentOrange
+            } else {
+                $lblPhase.ForeColor = $script:Colors.AccentGreen
+            }
+            $lblPhase.Text = $summary
+
+            $details = @()
+            if ($result.Files) { $details += "Files: $($result.Files.FoldersRestored) folders restored" }
+            if ($result.Programs) { $details += "Programs: $(@($result.Programs.Results | Where-Object { $_.Status -eq 'Installed' }).Count) installed" }
+            $lblRestoreStatus.Text = $details -join " | "
+
+            Update-StatusBar $summary
+            Write-Log $summary -Level 'SUCCESS'
+
+        } catch {
+            Write-Log "Restore error: $($_.Exception.Message)" -Level 'ERROR'
+            [System.Windows.Forms.MessageBox]::Show($_.Exception.Message, "Error", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)
+        } finally {
+            $script:OperationInProgress = $false
+            $btnRestore.Enabled = $true
+            $btnRestore.Text = "Restore Selected"
+        }
+    }.GetNewClosure())
+
+    $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $txtBundlePath, $btnBrowseBundle, $btnDetect, $resultsPanel, $restoreProgressPanel))
+}
+
 function Show-SettingsPage {
     if ($script:OperationInProgress) { return }
-    $script:ContentPanel.Controls.Clear()
+    Clear-ContentPanel
     Set-ActiveSidebarButton -Page "Settings"
     Update-StatusBar "Settings - Coming Soon"
     
@@ -2244,12 +3637,22 @@ function Show-MainForm {
     $btnFiles.Add_Click({ Show-FilesPage })
     $script:SidebarButtons["Files"] = $btnFiles
     
+    $btnTransfer = New-SidebarButton -Text "Transfer" -Page "Transfer" -AccentColor $script:Colors.AccentPink
+    $btnTransfer.Location = New-Object System.Drawing.Point(10, 230)
+    $btnTransfer.Add_Click({ Show-TransferPage })
+    $script:SidebarButtons["Transfer"] = $btnTransfer
+
+    $btnRestore = New-SidebarButton -Text "Restore" -Page "Restore" -AccentColor $script:Colors.AccentLightBlue
+    $btnRestore.Location = New-Object System.Drawing.Point(10, 280)
+    $btnRestore.Add_Click({ Show-RestorePage })
+    $script:SidebarButtons["Restore"] = $btnRestore
+
     $btnSettings = New-SidebarButton -Text "Settings" -Page "Settings" -AccentColor $script:Colors.AccentGray
-    $btnSettings.Location = New-Object System.Drawing.Point(10, 230)
+    $btnSettings.Location = New-Object System.Drawing.Point(10, 330)
     $btnSettings.Add_Click({ Show-SettingsPage })
     $script:SidebarButtons["Settings"] = $btnSettings
-    
-    $sidebar.Controls.AddRange(@($btnScan, $btnInstall, $btnFiles, $btnSettings))
+
+    $sidebar.Controls.AddRange(@($btnScan, $btnInstall, $btnFiles, $btnTransfer, $btnRestore, $btnSettings))
     
     $lblVersion = New-Object System.Windows.Forms.Label
     $lblVersion.Text = "v$($script:AppVersion)"
