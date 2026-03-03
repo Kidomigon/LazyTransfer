@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     NetworkEngine.ps1 — Remote transfer module for LazyTransfer v2.4
 
@@ -202,7 +202,10 @@ function Start-TransferServer {
                     try {
                         Add-Type -AssemblyName System.IO.Compression
 
-                        $archive = New-Object System.IO.Compression.ZipArchive($response.OutputStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
+                        # Buffer ZIP in memory first — HTTP response streams are non-seekable,
+                        # and ZipArchive needs to seek when finalizing the central directory
+                        $memStream = New-Object System.IO.MemoryStream
+                        $archive = New-Object System.IO.Compression.ZipArchive($memStream, [System.IO.Compression.ZipArchiveMode]::Create, $true)
                         # Reuse cached file list instead of re-scanning the directory
                         $files = if ($script:HttpServedFiles) { $script:HttpServedFiles } else { Get-ChildItem -Path $SourceFolder -Recurse -File -ErrorAction SilentlyContinue }
                         $totalFiles = $files.Count
@@ -231,8 +234,13 @@ function Start-TransferServer {
                             }
                         }
 
+                        # Finalize ZIP into memory buffer, then flush to HTTP response
                         $archive.Dispose()
-                        Write-Log "ZIP download complete ($totalFiles files)" -Level 'SUCCESS'
+                        $memStream.Position = 0
+                        $response.ContentLength64 = $memStream.Length
+                        $memStream.CopyTo($response.OutputStream)
+                        $memStream.Dispose()
+                        Write-Log "ZIP download complete ($totalFiles files, $([math]::Round($response.ContentLength64/1KB)) KB)" -Level 'SUCCESS'
                         if ($OnProgress) { & $OnProgress "Download" $totalFiles $totalFiles "Download complete" }
                     } catch {
                         Write-Log "ZIP streaming error: $($_.Exception.Message)" -Level 'ERROR'

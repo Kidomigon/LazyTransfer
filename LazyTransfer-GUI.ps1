@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     LazyTransfer v1.0 — Program Migration Tool for Windows 10/11
 
@@ -18,6 +18,267 @@ $ErrorActionPreference = 'Stop'
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
 Add-Type -AssemblyName System.Web
+
+#region Custom Controls
+Add-Type -ReferencedAssemblies System.Windows.Forms, System.Drawing -TypeDefinition @"
+using System;
+using System.Drawing;
+using System.Drawing.Drawing2D;
+using System.Drawing.Text;
+using System.Windows.Forms;
+using System.Runtime.InteropServices;
+
+public class DwmHelper {
+    [DllImport("dwmapi.dll")]
+    public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int attrValue, int attrSize);
+    public const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
+
+    public static void EnableDarkTitleBar(IntPtr handle) {
+        try {
+            int value = 1;
+            DwmSetWindowAttribute(handle, DWMWA_USE_IMMERSIVE_DARK_MODE, ref value, sizeof(int));
+        } catch { }
+    }
+}
+
+public class ModernButton : Button {
+    private Color _normalColor = Color.FromArgb(42, 44, 52);
+    private Color _hoverColor  = Color.FromArgb(52, 55, 65);
+    private Color _pressColor  = Color.FromArgb(35, 37, 44);
+    private Color _currentColor;
+    private int _radius = 8;
+
+    public ModernButton() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        _currentColor = _normalColor;
+        FlatStyle = FlatStyle.Flat;
+        FlatAppearance.BorderSize = 0;
+        ForeColor = Color.FromArgb(235, 235, 242);
+        Cursor = Cursors.Hand;
+        Font = new Font("Segoe UI", 10f);
+    }
+
+    public Color NormalColor {
+        get { return _normalColor; }
+        set { _normalColor = value; _currentColor = value; Invalidate(); }
+    }
+    public Color HoverColor {
+        get { return _hoverColor; }
+        set { _hoverColor = value; Invalidate(); }
+    }
+    public Color PressColor {
+        get { return _pressColor; }
+        set { _pressColor = value; Invalidate(); }
+    }
+    public int Radius {
+        get { return _radius; }
+        set { _radius = value; Invalidate(); }
+    }
+
+    protected override void OnMouseEnter(EventArgs e) {
+        base.OnMouseEnter(e);
+        _currentColor = _hoverColor;
+        Invalidate();
+    }
+    protected override void OnMouseLeave(EventArgs e) {
+        base.OnMouseLeave(e);
+        _currentColor = _normalColor;
+        Invalidate();
+    }
+    protected override void OnMouseDown(MouseEventArgs e) {
+        base.OnMouseDown(e);
+        _currentColor = _pressColor;
+        Invalidate();
+    }
+    protected override void OnMouseUp(MouseEventArgs e) {
+        base.OnMouseUp(e);
+        _currentColor = ClientRectangle.Contains(e.Location) ? _hoverColor : _normalColor;
+        Invalidate();
+    }
+    protected override void OnEnabledChanged(EventArgs e) {
+        base.OnEnabledChanged(e);
+        Invalidate();
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+        var r = ClientRectangle;
+        r.Inflate(-1, -1);
+        int d = _radius * 2;
+        if (d > r.Height) d = r.Height;
+
+        using (var path = new GraphicsPath()) {
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+
+            var fillColor = Enabled ? _currentColor : Color.FromArgb(35, 37, 42);
+            using (var brush = new SolidBrush(fillColor))
+                g.FillPath(brush, path);
+        }
+
+        var textColor = Enabled ? ForeColor : Color.FromArgb(90, 93, 105);
+        using (var sf = new StringFormat { Alignment = StringAlignment.Center, LineAlignment = StringAlignment.Center })
+        using (var textBrush = new SolidBrush(textColor))
+            g.DrawString(Text, Font, textBrush, ClientRectangle, sf);
+    }
+}
+
+public class ModernProgressBar : Control {
+    private int _value = 0;
+    private int _maximum = 100;
+    private Color _barColor = Color.FromArgb(52, 211, 153);
+    private Color _barEndColor = Color.Empty;
+    private Color _trackColor = Color.FromArgb(34, 36, 42);
+    private int _radius = 5;
+
+    public ModernProgressBar() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw, true);
+        Size = new Size(200, 14);
+        DoubleBuffered = true;
+    }
+
+    public int Value {
+        get { return _value; }
+        set { _value = Math.Max(0, Math.Min(value, _maximum)); Invalidate(); }
+    }
+    public int Maximum {
+        get { return _maximum; }
+        set { _maximum = Math.Max(1, value); Invalidate(); }
+    }
+    public Color BarColor {
+        get { return _barColor; }
+        set { _barColor = value; Invalidate(); }
+    }
+    public Color BarEndColor {
+        get { return _barEndColor; }
+        set { _barEndColor = value; Invalidate(); }
+    }
+    public Color TrackColor {
+        get { return _trackColor; }
+        set { _trackColor = value; Invalidate(); }
+    }
+    public int Radius {
+        get { return _radius; }
+        set { _radius = value; Invalidate(); }
+    }
+    public ProgressBarStyle Style { get; set; }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+
+        var r = ClientRectangle;
+        int d = Math.Min(_radius * 2, r.Height);
+
+        // Track
+        using (var trackPath = MakeRoundedPath(r, d))
+        using (var trackBrush = new SolidBrush(_trackColor))
+            g.FillPath(trackBrush, trackPath);
+
+        // Fill
+        double pct = _maximum > 0 ? (double)_value / _maximum : 0;
+        int fillWidth = (int)(r.Width * pct);
+        if (fillWidth > d && pct > 0) {
+            var fillRect = new Rectangle(r.Left, r.Top, fillWidth, r.Height);
+            using (var fillPath = MakeRoundedPath(fillRect, d)) {
+                Color endColor = _barEndColor.IsEmpty ? _barColor : _barEndColor;
+                using (var fillBrush = new LinearGradientBrush(fillRect, _barColor, endColor, LinearGradientMode.Horizontal))
+                    g.FillPath(fillBrush, fillPath);
+            }
+        }
+    }
+
+    private GraphicsPath MakeRoundedPath(Rectangle r, int d) {
+        var path = new GraphicsPath();
+        path.AddArc(r.Left, r.Top, d, d, 180, 90);
+        path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+        path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+        path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+        path.CloseFigure();
+        return path;
+    }
+}
+
+public class ModernCard : Panel {
+    private int _radius = 10;
+    private Color _borderColor = Color.FromArgb(48, 50, 58);
+    private Color _fillColor = Color.FromArgb(34, 36, 42);
+    private string _headerText = "";
+    private Color _headerColor = Color.FromArgb(130, 133, 145);
+    private Font _headerFont;
+
+    public ModernCard() {
+        SetStyle(ControlStyles.UserPaint | ControlStyles.AllPaintingInWmPaint |
+                 ControlStyles.OptimizedDoubleBuffer | ControlStyles.ResizeRedraw |
+                 ControlStyles.SupportsTransparentColor, true);
+        BackColor = Color.Transparent;
+        _headerFont = new Font("Segoe UI", 10f, FontStyle.Bold);
+        Padding = new Padding(12, 32, 12, 12);
+    }
+
+    public int Radius {
+        get { return _radius; }
+        set { _radius = value; Invalidate(); }
+    }
+    public Color BorderColor {
+        get { return _borderColor; }
+        set { _borderColor = value; Invalidate(); }
+    }
+    public Color FillColor {
+        get { return _fillColor; }
+        set { _fillColor = value; Invalidate(); }
+    }
+    public string HeaderText {
+        get { return _headerText; }
+        set { _headerText = value; Invalidate(); }
+    }
+    public Color HeaderColor {
+        get { return _headerColor; }
+        set { _headerColor = value; Invalidate(); }
+    }
+
+    protected override void OnPaint(PaintEventArgs e) {
+        var g = e.Graphics;
+        g.SmoothingMode = SmoothingMode.AntiAlias;
+        g.TextRenderingHint = TextRenderingHint.ClearTypeGridFit;
+
+        var r = ClientRectangle;
+        r.Inflate(-1, -1);
+        int d = _radius * 2;
+
+        using (var path = new GraphicsPath()) {
+            path.AddArc(r.Left, r.Top, d, d, 180, 90);
+            path.AddArc(r.Right - d, r.Top, d, d, 270, 90);
+            path.AddArc(r.Right - d, r.Bottom - d, d, d, 0, 90);
+            path.AddArc(r.Left, r.Bottom - d, d, d, 90, 90);
+            path.CloseFigure();
+
+            using (var fill = new SolidBrush(_fillColor))
+                g.FillPath(fill, path);
+            using (var pen = new Pen(_borderColor, 1f))
+                g.DrawPath(pen, path);
+        }
+
+        if (!string.IsNullOrEmpty(_headerText)) {
+            using (var brush = new SolidBrush(_headerColor))
+                g.DrawString(_headerText, _headerFont, brush, 14, 10);
+        }
+    }
+
+    protected override void OnPaintBackground(PaintEventArgs e) {
+        // Skip default background painting
+    }
+}
+"@ -ErrorAction SilentlyContinue
+#endregion Custom Controls
 
 #region Icon
 function Get-AppIcon {
@@ -288,25 +549,27 @@ function Get-CategoryInfo {
 
 #region Theme Colors
 $script:Colors = @{
-    WindowBg       = [System.Drawing.Color]::FromArgb(30, 30, 30)
-    SidebarBg      = [System.Drawing.Color]::FromArgb(20, 20, 20)
-    ContentBg      = [System.Drawing.Color]::FromArgb(40, 40, 40)
-    TextPrimary    = [System.Drawing.Color]::FromArgb(240, 240, 240)
-    TextSecondary  = [System.Drawing.Color]::FromArgb(160, 160, 160)
-    TextDark       = [System.Drawing.Color]::FromArgb(30, 30, 30)
-    AccentBlue     = [System.Drawing.Color]::FromArgb(0, 122, 204)
-    AccentGreen    = [System.Drawing.Color]::FromArgb(46, 160, 67)
-    AccentOrange   = [System.Drawing.Color]::FromArgb(227, 150, 62)
-    AccentGray     = [System.Drawing.Color]::FromArgb(100, 100, 100)
-    AccentRed      = [System.Drawing.Color]::FromArgb(200, 60, 60)
-    AccentPink     = [System.Drawing.Color]::FromArgb(233, 69, 96)
-    AccentLightBlue = [System.Drawing.Color]::FromArgb(88, 166, 255)
-    ButtonBg       = [System.Drawing.Color]::FromArgb(60, 60, 60)
-    ButtonHover    = [System.Drawing.Color]::FromArgb(80, 80, 80)
-    InputBg        = [System.Drawing.Color]::FromArgb(50, 50, 50)
-    BorderColor    = [System.Drawing.Color]::FromArgb(70, 70, 70)
-    SidebarHover   = [System.Drawing.Color]::FromArgb(50, 50, 50)
-    SidebarActive  = [System.Drawing.Color]::FromArgb(60, 60, 60)
+    WindowBg        = [System.Drawing.Color]::FromArgb(18, 18, 22)
+    SidebarBg       = [System.Drawing.Color]::FromArgb(14, 14, 18)
+    ContentBg       = [System.Drawing.Color]::FromArgb(26, 28, 32)
+    CardBg          = [System.Drawing.Color]::FromArgb(34, 36, 42)
+    TextPrimary     = [System.Drawing.Color]::FromArgb(235, 235, 242)
+    TextSecondary   = [System.Drawing.Color]::FromArgb(130, 133, 145)
+    TextDark        = [System.Drawing.Color]::FromArgb(18, 18, 22)
+    AccentBlue      = [System.Drawing.Color]::FromArgb(56, 152, 255)
+    AccentGreen     = [System.Drawing.Color]::FromArgb(52, 211, 153)
+    AccentOrange    = [System.Drawing.Color]::FromArgb(251, 146, 60)
+    AccentGray      = [System.Drawing.Color]::FromArgb(90, 93, 105)
+    AccentRed       = [System.Drawing.Color]::FromArgb(248, 113, 113)
+    AccentPink      = [System.Drawing.Color]::FromArgb(244, 114, 182)
+    AccentLightBlue = [System.Drawing.Color]::FromArgb(96, 165, 250)
+    ButtonBg        = [System.Drawing.Color]::FromArgb(42, 44, 52)
+    ButtonHover     = [System.Drawing.Color]::FromArgb(52, 55, 65)
+    InputBg         = [System.Drawing.Color]::FromArgb(22, 24, 28)
+    InputBorder     = [System.Drawing.Color]::FromArgb(52, 55, 65)
+    BorderColor     = [System.Drawing.Color]::FromArgb(48, 50, 58)
+    SidebarHover    = [System.Drawing.Color]::FromArgb(28, 30, 36)
+    SidebarActive   = [System.Drawing.Color]::FromArgb(32, 34, 40)
 }
 #endregion Theme Colors
 
@@ -870,6 +1133,9 @@ function Start-FilesMigration {
     $finalPath = $migrationFolder
     if (-not $script:CancelRequested -and $Mode -eq "zip") {
         Write-Log "Compressing to ZIP archive..."
+        # Stop transcript BEFORE zipping — the log file is inside the migration folder
+        # and Compress-Archive can't read a file locked by Start-Transcript
+        try { Stop-Transcript | Out-Null } catch { }
         if ($OnProgress) { & $OnProgress "Compressing ZIP" $copiedBytes $totalBytes $totalFolders $totalFolders "Compressing..." }
         Update-GuiStatus
 
@@ -878,7 +1144,6 @@ function Start-FilesMigration {
             Compress-Archive -Path "$migrationFolder\*" -DestinationPath $zipPath -Force
             Remove-Item -Path $migrationFolder -Recurse -Force
             $finalPath = $zipPath
-            Write-Log "[OK] ZIP archive created: $zipPath" -Level 'SUCCESS'
         } catch {
             Write-Log "ZIP compression failed, keeping uncompressed folder: $($_.Exception.Message)" -Level 'WARN'
             $errors.Add("ZIP failed: $($_.Exception.Message)")
@@ -887,9 +1152,9 @@ function Start-FilesMigration {
         }
 
         if ($OnProgress) { & $OnProgress "Complete" $totalBytes $totalBytes $totalFolders $totalFolders "Done" }
+    } else {
+        try { Stop-Transcript | Out-Null } catch { }
     }
-
-    try { Stop-Transcript | Out-Null } catch { }
 
     return [PSCustomObject]@{
         Success        = ($errors.Count -eq 0)
@@ -1299,7 +1564,6 @@ function Import-BrowserBookmarks {
                     } else {
                         $results.Add([PSCustomObject]@{ Browser = "Firefox"; Status = "No backup found" })
                     }
-                }
             }
         } catch {
             Write-Log "Failed to restore $browser bookmarks: $($_.Exception.Message)" -Level 'ERROR'
@@ -1640,16 +1904,21 @@ function New-StyledButton {
         [System.Drawing.Color]$BackColor,
         [System.Drawing.Color]$ForeColor
     )
-    $btn = New-Object System.Windows.Forms.Button
+    $btn = New-Object ModernButton
     $btn.Text = $Text
     $btn.Size = New-Object System.Drawing.Size($Width, $Height)
-    $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-    $btn.FlatAppearance.BorderSize = 1
-    $btn.FlatAppearance.BorderColor = $script:Colors.BorderColor
-    $btn.BackColor = $BackColor
+    $btn.NormalColor = $BackColor
+    # Compute lighter hover color
+    $hR = [Math]::Min(255, $BackColor.R + 15)
+    $hG = [Math]::Min(255, $BackColor.G + 15)
+    $hB = [Math]::Min(255, $BackColor.B + 15)
+    $btn.HoverColor = [System.Drawing.Color]::FromArgb($hR, $hG, $hB)
+    $pR = [Math]::Max(0, $BackColor.R - 10)
+    $pG = [Math]::Max(0, $BackColor.G - 10)
+    $pB = [Math]::Max(0, $BackColor.B - 10)
+    $btn.PressColor = [System.Drawing.Color]::FromArgb($pR, $pG, $pB)
     $btn.ForeColor = $ForeColor
     $btn.Font = New-Object System.Drawing.Font("Segoe UI", 10)
-    $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
     return $btn
 }
 
@@ -1660,28 +1929,52 @@ function New-SidebarButton {
         [System.Drawing.Color]$AccentColor
     )
     $btn = New-Object System.Windows.Forms.Button
-    $btn.Text = "  $Text"
-    $btn.Size = New-Object System.Drawing.Size(180, 45)
+    $btn.Text = "      $Text"
+    $btn.Size = New-Object System.Drawing.Size(200, 44)
     $btn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
     $btn.FlatAppearance.BorderSize = 0
-    $btn.BackColor = $script:Colors.SidebarBg
-    $btn.ForeColor = $script:Colors.TextPrimary
-    $btn.Font = New-Object System.Drawing.Font("Segoe UI", 11)
+    $btn.BackColor = [System.Drawing.Color]::Transparent
+    $btn.ForeColor = $script:Colors.TextSecondary
+    $btn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
     $btn.TextAlign = [System.Drawing.ContentAlignment]::MiddleLeft
     $btn.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $btn.Tag = @{ Page = $Page; Accent = $AccentColor }
-    
-    $btn.Add_MouseEnter({
-        $this.BackColor = $script:Colors.SidebarHover
-    })
-    $btn.Add_MouseLeave({
-        if ($script:CurrentPage -eq $this.Tag.Page) {
-            $this.BackColor = $script:Colors.SidebarActive
-        } else {
-            $this.BackColor = $script:Colors.SidebarBg
+    $btn.Tag = @{ Page = $Page; Accent = $AccentColor; IsActive = $false }
+
+    # Paint accent bar on left edge when active
+    $btn.Add_Paint({
+        param($s, $e)
+        if ($s.Tag.IsActive) {
+            $g = $e.Graphics
+            $g.SmoothingMode = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+            try {
+                $accentBrush = New-Object System.Drawing.SolidBrush($s.Tag.Accent)
+                # 3px rounded accent bar, vertically centered
+                $barHeight = [int]($s.Height * 0.6)
+                $barY = ($s.Height - $barHeight) / 2
+                $path = New-Object System.Drawing.Drawing2D.GraphicsPath
+                $path.AddArc(0, $barY, 3, 3, 180, 90)
+                $path.AddArc(0, $barY + $barHeight - 3, 3, 3, 90, 90)
+                $path.CloseFigure()
+                $g.FillRectangle($accentBrush, 0, $barY, 3, $barHeight)
+                $accentBrush.Dispose()
+                $path.Dispose()
+            } catch { }
         }
     })
-    
+
+    $btn.Add_MouseEnter({
+        if (-not $this.Tag.IsActive) {
+            $this.BackColor = $script:Colors.SidebarHover
+        }
+    })
+    $btn.Add_MouseLeave({
+        if ($this.Tag.IsActive) {
+            $this.BackColor = $script:Colors.SidebarActive
+        } else {
+            $this.BackColor = [System.Drawing.Color]::Transparent
+        }
+    })
+
     return $btn
 }
 
@@ -1690,13 +1983,18 @@ function Set-ActiveSidebarButton {
     $script:CurrentPage = $Page
     foreach ($key in $script:SidebarButtons.Keys) {
         $btn = $script:SidebarButtons[$key]
-        if ($key -eq $Page) {
+        $isActive = ($key -eq $Page)
+        $btn.Tag.IsActive = $isActive
+        if ($isActive) {
             $btn.BackColor = $script:Colors.SidebarActive
             $btn.ForeColor = $btn.Tag.Accent
+            $btn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
         } else {
-            $btn.BackColor = $script:Colors.SidebarBg
-            $btn.ForeColor = $script:Colors.TextPrimary
+            $btn.BackColor = [System.Drawing.Color]::Transparent
+            $btn.ForeColor = $script:Colors.TextSecondary
+            $btn.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Regular)
         }
+        $btn.Invalidate()
     }
 }
 
@@ -1894,16 +2192,15 @@ function Show-InstallPage {
     $categoryList = @('Browsers', 'DevTools', 'Media', 'Graphics', 'Office', 'Communication', 'Utilities', 'Gaming', 'Security', 'Other')
     foreach ($cat in $categoryList) {
         $catInfo = Get-CategoryInfo -Category $cat
-        $catBtn = New-Object System.Windows.Forms.Button
+        $catBtn = New-Object ModernButton
         $catBtn.Text = "$cat (0)"
         $catBtn.Font = New-Object System.Drawing.Font("Segoe UI", 7)
         $catBtn.Size = New-Object System.Drawing.Size(75, 24)
-        $catBtn.FlatStyle = [System.Windows.Forms.FlatStyle]::Flat
-        $catBtn.FlatAppearance.BorderSize = 1
-        $catBtn.FlatAppearance.BorderColor = $script:Colors.BorderColor
-        $catBtn.BackColor = $script:Colors.ButtonBg
+        $catBtn.NormalColor = $script:Colors.ButtonBg
+        $catBtn.HoverColor = $script:Colors.ButtonHover
         $catBtn.ForeColor = $script:Colors.TextSecondary
         $catBtn.Tag = $cat
+        $catBtn.Radius = 4
         $catBtn.Margin = New-Object System.Windows.Forms.Padding(2, 0, 2, 0)
         $script:CategoryButtons[$cat] = $catBtn
         $script:CategoryCounts[$cat] = 0
@@ -1942,11 +2239,11 @@ function Show-InstallPage {
                 }
             }
             # Visual feedback - briefly highlight the button
-            $sender.BackColor = $script:Colors.AccentGreen
+            $sender.NormalColor = $script:Colors.AccentGreen
             $timer = New-Object System.Windows.Forms.Timer
             $timer.Interval = 200
             $timer.Add_Tick({
-                try { if (-not $sender.IsDisposed) { $sender.BackColor = $script:Colors.ButtonBg } } catch { }
+                try { if (-not $sender.IsDisposed) { $sender.NormalColor = $script:Colors.ButtonBg; $sender.Invalidate() } } catch { }
                 $timer.Stop()
                 $timer.Dispose()
             }.GetNewClosure())
@@ -1985,10 +2282,11 @@ function Show-InstallPage {
     $lblPercent.Location = New-Object System.Drawing.Point(0, 0)
     $lblPercent.Size = New-Object System.Drawing.Size(50, 25)
 
-    $progress = New-Object System.Windows.Forms.ProgressBar
+    $progress = New-Object ModernProgressBar
     $progress.Location = New-Object System.Drawing.Point(55, 5)
-    $progress.Size = New-Object System.Drawing.Size(265, 18)
-    $progress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+    $progress.Size = New-Object System.Drawing.Size(265, 14)
+    $progress.BarColor = $script:Colors.AccentGreen
+    $progress.TrackColor = $script:Colors.CardBg
 
     $lblCurrentApp = New-Object System.Windows.Forms.Label
     $lblCurrentApp.Text = ""
@@ -2493,10 +2791,11 @@ function Show-FilesPage {
     $lblFilesPercent.Location = New-Object System.Drawing.Point(0, 0)
     $lblFilesPercent.Size = New-Object System.Drawing.Size(55, 25)
 
-    $filesProgress = New-Object System.Windows.Forms.ProgressBar
+    $filesProgress = New-Object ModernProgressBar
     $filesProgress.Location = New-Object System.Drawing.Point(60, 5)
-    $filesProgress.Size = New-Object System.Drawing.Size(400, 18)
-    $filesProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+    $filesProgress.Size = New-Object System.Drawing.Size(400, 14)
+    $filesProgress.BarColor = $script:Colors.AccentOrange
+    $filesProgress.TrackColor = $script:Colors.CardBg
 
     $lblCurrentFolder = New-Object System.Windows.Forms.Label
     $lblCurrentFolder.Text = ""
@@ -2734,11 +3033,11 @@ function Show-TransferPage {
     $subtitle.AutoSize = $true
 
     # --- CARD 1: Send (HTTP Server) ---
-    $card1 = New-Object System.Windows.Forms.GroupBox
-    $card1.Text = "Send (HTTP Server)"
-    $card1.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $card1.ForeColor = $accentColor
-    $card1.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card1 = New-Object ModernCard
+    $card1.HeaderText = "Send (HTTP Server)"
+    $card1.HeaderColor = $accentColor
+    $card1.FillColor = $script:Colors.CardBg
+    $card1.BorderColor = $script:Colors.BorderColor
     $card1.Location = New-Object System.Drawing.Point(20, 80)
     $card1.Size = New-Object System.Drawing.Size(360, 130)
 
@@ -2776,11 +3075,11 @@ function Show-TransferPage {
     $card1.Controls.AddRange(@($txtServerFolder, $btnBrowseServer, $lblServerUrl, $btnStartServer, $btnStopServer))
 
     # --- CARD 2: Send (Direct TCP) ---
-    $card2 = New-Object System.Windows.Forms.GroupBox
-    $card2.Text = "Send (Direct TCP)"
-    $card2.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $card2.ForeColor = $accentColor
-    $card2.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card2 = New-Object ModernCard
+    $card2.HeaderText = "Send (Direct TCP)"
+    $card2.HeaderColor = $accentColor
+    $card2.FillColor = $script:Colors.CardBg
+    $card2.BorderColor = $script:Colors.BorderColor
     $card2.Location = New-Object System.Drawing.Point(400, 80)
     $card2.Size = New-Object System.Drawing.Size(360, 130)
 
@@ -2814,11 +3113,11 @@ function Show-TransferPage {
     $card2.Controls.AddRange(@($txtTcpFolder, $btnBrowseTcp, $lblTcpInfo, $btnStartTcp))
 
     # --- CARD 3: Receive ---
-    $card3 = New-Object System.Windows.Forms.GroupBox
-    $card3.Text = "Receive"
-    $card3.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $card3.ForeColor = $accentColor
-    $card3.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card3 = New-Object ModernCard
+    $card3.HeaderText = "Receive"
+    $card3.HeaderColor = $accentColor
+    $card3.FillColor = $script:Colors.CardBg
+    $card3.BorderColor = $script:Colors.BorderColor
     $card3.Location = New-Object System.Drawing.Point(20, 220)
     $card3.Size = New-Object System.Drawing.Size(360, 130)
 
@@ -2870,11 +3169,11 @@ function Show-TransferPage {
     $card3.Controls.AddRange(@($lblIP, $txtRemoteIP, $lblSaveRecv, $txtRecvFolder, $btnBrowseRecv, $btnDownloadHttp, $btnReceiveTcp))
 
     # --- CARD 4: Shared Folder ---
-    $card4 = New-Object System.Windows.Forms.GroupBox
-    $card4.Text = "Shared Folder"
-    $card4.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $card4.ForeColor = $accentColor
-    $card4.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $card4 = New-Object ModernCard
+    $card4.HeaderText = "Shared Folder"
+    $card4.HeaderColor = $accentColor
+    $card4.FillColor = $script:Colors.CardBg
+    $card4.BorderColor = $script:Colors.BorderColor
     $card4.Location = New-Object System.Drawing.Point(400, 220)
     $card4.Size = New-Object System.Drawing.Size(360, 130)
 
@@ -2933,11 +3232,11 @@ function Show-TransferPage {
     $card4.Controls.AddRange(@($lblShareSrc, $txtShareSrc, $btnBrowseShareSrc, $lblShareDest, $txtShareDest, $btnBrowseShareDest, $btnCopyShare))
 
     # --- Status Panel ---
-    $statusGroup = New-Object System.Windows.Forms.GroupBox
-    $statusGroup.Text = "Transfer Status"
-    $statusGroup.Font = New-Object System.Drawing.Font("Segoe UI", 10, [System.Drawing.FontStyle]::Bold)
-    $statusGroup.ForeColor = $script:Colors.TextSecondary
-    $statusGroup.BackColor = [System.Drawing.Color]::FromArgb(50, 50, 50)
+    $statusGroup = New-Object ModernCard
+    $statusGroup.HeaderText = "Transfer Status"
+    $statusGroup.HeaderColor = $script:Colors.TextSecondary
+    $statusGroup.FillColor = $script:Colors.CardBg
+    $statusGroup.BorderColor = $script:Colors.BorderColor
     $statusGroup.Location = New-Object System.Drawing.Point(20, 360)
     $statusGroup.Size = New-Object System.Drawing.Size(740, 150)
 
@@ -2952,10 +3251,11 @@ function Show-TransferPage {
     $txtTransferLog.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $txtTransferLog.ReadOnly = $true
 
-    $transferProgress = New-Object System.Windows.Forms.ProgressBar
+    $transferProgress = New-Object ModernProgressBar
     $transferProgress.Location = New-Object System.Drawing.Point(10, 110)
-    $transferProgress.Size = New-Object System.Drawing.Size(610, 20)
-    $transferProgress.Style = [System.Windows.Forms.ProgressBarStyle]::Continuous
+    $transferProgress.Size = New-Object System.Drawing.Size(610, 14)
+    $transferProgress.BarColor = $script:Colors.AccentPink
+    $transferProgress.TrackColor = $script:Colors.CardBg
 
     $btnStopTransfer = New-StyledButton -Text "Stop" -Width 90 -Height 35 -BackColor $script:Colors.AccentRed -ForeColor $script:Colors.TextPrimary
     $btnStopTransfer.Location = New-Object System.Drawing.Point(635, 22)
@@ -3346,10 +3646,11 @@ function Show-RestorePage {
     $lblPhase.Location = New-Object System.Drawing.Point(0, 0)
     $lblPhase.Size = New-Object System.Drawing.Size(740, 20)
 
-    $restoreBar = New-Object System.Windows.Forms.ProgressBar
+    $restoreBar = New-Object ModernProgressBar
     $restoreBar.Location = New-Object System.Drawing.Point(0, 25)
-    $restoreBar.Size = New-Object System.Drawing.Size(740, 18)
-    $restoreBar.Style = [System.Windows.Forms.ProgressBarStyle]::Marquee
+    $restoreBar.Size = New-Object System.Drawing.Size(740, 14)
+    $restoreBar.BarColor = $script:Colors.AccentLightBlue
+    $restoreBar.TrackColor = $script:Colors.CardBg
 
     $lblRestoreStatus = New-Object System.Windows.Forms.Label
     $lblRestoreStatus.Text = ""
@@ -3556,29 +3857,6 @@ function Show-RestorePage {
     $script:ContentPanel.Controls.AddRange(@($title, $subtitle, $txtBundlePath, $btnBrowseBundle, $btnDetect, $resultsPanel, $restoreProgressPanel))
 }
 
-function Show-SettingsPage {
-    if ($script:OperationInProgress) { return }
-    Clear-ContentPanel
-    Set-ActiveSidebarButton -Page "Settings"
-    Update-StatusBar "Settings - Coming Soon"
-    
-    $title = New-Object System.Windows.Forms.Label
-    $title.Text = "Settings"
-    $title.Font = New-Object System.Drawing.Font("Segoe UI", 18, [System.Drawing.FontStyle]::Bold)
-    $title.ForeColor = $script:Colors.AccentGray
-    $title.Location = New-Object System.Drawing.Point(20, 15)
-    $title.AutoSize = $true
-    
-    $coming = New-Object System.Windows.Forms.Label
-    $coming.Text = "Coming Soon!`n`nPlanned settings:`n`n- Default save location`n- Auto-install winget/chocolatey toggle`n- Custom app mappings`n- Theme options"
-    $coming.Font = New-Object System.Drawing.Font("Segoe UI", 12)
-    $coming.ForeColor = $script:Colors.TextSecondary
-    $coming.Location = New-Object System.Drawing.Point(20, 60)
-    $coming.Size = New-Object System.Drawing.Size(600, 200)
-    
-    $script:ContentPanel.Controls.AddRange(@($title, $coming))
-}
-
 function Show-MainForm {
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "$($script:AppName) v$($script:AppVersion)"
@@ -3586,6 +3864,15 @@ function Show-MainForm {
     $form.BackColor = $script:Colors.WindowBg
     $form.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::FixedSingle
     $form.MaximizeBox = $false
+
+    # Enable double buffering to eliminate flicker
+    $form.DoubleBuffered = $true
+    try {
+        $form.GetType().GetMethod('SetStyle', [System.Reflection.BindingFlags]'NonPublic,Instance').Invoke($form, @(
+            [System.Windows.Forms.ControlStyles]::OptimizedDoubleBuffer -bor
+            [System.Windows.Forms.ControlStyles]::AllPaintingInWmPaint -bor
+            [System.Windows.Forms.ControlStyles]::UserPaint, $true))
+    } catch { }
 
     # Restore window position from settings, or center if first run
     if ($script:UserSettings.WindowX -ge 0 -and $script:UserSettings.WindowY -ge 0) {
@@ -3603,76 +3890,101 @@ function Show-MainForm {
         }
     })
 
+    # Enable dark title bar on Windows 10/11
+    $form.Add_HandleCreated({
+        try { [DwmHelper]::EnableDarkTitleBar($form.Handle) } catch { }
+    })
+
     # Set app icon (Windows built-in)
     $appIcon = Get-AppIcon
     if ($appIcon) {
         $form.Icon = $appIcon
     }
-    
+
     $sidebar = New-Object System.Windows.Forms.Panel
     $sidebar.Location = New-Object System.Drawing.Point(0, 0)
     $sidebar.Size = New-Object System.Drawing.Size(200, 700)
     $sidebar.BackColor = $script:Colors.SidebarBg
-    
+
+    # Sidebar gradient background
+    $sidebar.Add_Paint({
+        param($s, $e)
+        $g = $e.Graphics
+        $r = $s.ClientRectangle
+        try {
+            $brush = New-Object System.Drawing.Drawing2D.LinearGradientBrush(
+                $r,
+                [System.Drawing.Color]::FromArgb(16, 16, 22),
+                [System.Drawing.Color]::FromArgb(12, 12, 16),
+                [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
+            $g.FillRectangle($brush, $r)
+            $brush.Dispose()
+        } catch { }
+    })
+
     $lblAppName = New-Object System.Windows.Forms.Label
     $lblAppName.Text = "LazyTransfer"
     $lblAppName.Font = New-Object System.Drawing.Font("Segoe UI", 14, [System.Drawing.FontStyle]::Bold)
     $lblAppName.ForeColor = $script:Colors.TextPrimary
     $lblAppName.Location = New-Object System.Drawing.Point(15, 20)
     $lblAppName.AutoSize = $true
+    $lblAppName.BackColor = [System.Drawing.Color]::Transparent
     $sidebar.Controls.Add($lblAppName)
-    
+
+    # Separator line between title and nav
+    $separator = New-Object System.Windows.Forms.Panel
+    $separator.Location = New-Object System.Drawing.Point(15, 55)
+    $separator.Size = New-Object System.Drawing.Size(170, 1)
+    $separator.BackColor = $script:Colors.BorderColor
+    $sidebar.Controls.Add($separator)
+
     $btnScan = New-SidebarButton -Text "Scan" -Page "Scan" -AccentColor $script:Colors.AccentBlue
-    $btnScan.Location = New-Object System.Drawing.Point(10, 80)
+    $btnScan.Location = New-Object System.Drawing.Point(0, 70)
     $btnScan.Add_Click({ Show-ScanPage })
     $script:SidebarButtons["Scan"] = $btnScan
-    
+
     $btnInstall = New-SidebarButton -Text "Install" -Page "Install" -AccentColor $script:Colors.AccentGreen
-    $btnInstall.Location = New-Object System.Drawing.Point(10, 130)
+    $btnInstall.Location = New-Object System.Drawing.Point(0, 118)
     $btnInstall.Add_Click({ Show-InstallPage })
     $script:SidebarButtons["Install"] = $btnInstall
-    
+
     $btnFiles = New-SidebarButton -Text "Files" -Page "Files" -AccentColor $script:Colors.AccentOrange
-    $btnFiles.Location = New-Object System.Drawing.Point(10, 180)
+    $btnFiles.Location = New-Object System.Drawing.Point(0, 166)
     $btnFiles.Add_Click({ Show-FilesPage })
     $script:SidebarButtons["Files"] = $btnFiles
-    
+
     $btnTransfer = New-SidebarButton -Text "Transfer" -Page "Transfer" -AccentColor $script:Colors.AccentPink
-    $btnTransfer.Location = New-Object System.Drawing.Point(10, 230)
+    $btnTransfer.Location = New-Object System.Drawing.Point(0, 214)
     $btnTransfer.Add_Click({ Show-TransferPage })
     $script:SidebarButtons["Transfer"] = $btnTransfer
 
     $btnRestore = New-SidebarButton -Text "Restore" -Page "Restore" -AccentColor $script:Colors.AccentLightBlue
-    $btnRestore.Location = New-Object System.Drawing.Point(10, 280)
+    $btnRestore.Location = New-Object System.Drawing.Point(0, 262)
     $btnRestore.Add_Click({ Show-RestorePage })
     $script:SidebarButtons["Restore"] = $btnRestore
 
-    $btnSettings = New-SidebarButton -Text "Settings" -Page "Settings" -AccentColor $script:Colors.AccentGray
-    $btnSettings.Location = New-Object System.Drawing.Point(10, 330)
-    $btnSettings.Add_Click({ Show-SettingsPage })
-    $script:SidebarButtons["Settings"] = $btnSettings
+    $sidebar.Controls.AddRange(@($btnScan, $btnInstall, $btnFiles, $btnTransfer, $btnRestore))
 
-    $sidebar.Controls.AddRange(@($btnScan, $btnInstall, $btnFiles, $btnTransfer, $btnRestore, $btnSettings))
-    
     $lblVersion = New-Object System.Windows.Forms.Label
     $lblVersion.Text = "v$($script:AppVersion)"
     $lblVersion.Font = New-Object System.Drawing.Font("Segoe UI", 9)
     $lblVersion.ForeColor = $script:Colors.TextSecondary
     $lblVersion.Location = New-Object System.Drawing.Point(15, 620)
     $lblVersion.AutoSize = $true
+    $lblVersion.BackColor = [System.Drawing.Color]::Transparent
     $sidebar.Controls.Add($lblVersion)
-    
+
     $script:ContentPanel = New-Object System.Windows.Forms.Panel
     $script:ContentPanel.Location = New-Object System.Drawing.Point(200, 0)
     $script:ContentPanel.Size = New-Object System.Drawing.Size(808, 550)
     $script:ContentPanel.BackColor = $script:Colors.ContentBg
     $script:ContentPanel.AutoScroll = $true
-    
+
     $logPanel = New-Object System.Windows.Forms.Panel
     $logPanel.Location = New-Object System.Drawing.Point(200, 550)
     $logPanel.Size = New-Object System.Drawing.Size(808, 80)
     $logPanel.BackColor = $script:Colors.SidebarBg
-    
+
     $lblLog = New-Object System.Windows.Forms.Label
     $lblLog.Text = "Log:"
     $lblLog.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -3680,25 +3992,25 @@ function Show-MainForm {
     $lblLog.Location = New-Object System.Drawing.Point(10, 5)
     $lblLog.AutoSize = $true
     $logPanel.Controls.Add($lblLog)
-    
+
     $script:LogTextBox = New-Object System.Windows.Forms.TextBox
     $script:LogTextBox.Location = New-Object System.Drawing.Point(10, 25)
     $script:LogTextBox.Size = New-Object System.Drawing.Size(785, 45)
     $script:LogTextBox.Font = New-Object System.Drawing.Font("Consolas", 8)
     $script:LogTextBox.BackColor = $script:Colors.InputBg
     $script:LogTextBox.ForeColor = $script:Colors.TextSecondary
-    $script:LogTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::FixedSingle
+    $script:LogTextBox.BorderStyle = [System.Windows.Forms.BorderStyle]::None
     $script:LogTextBox.Multiline = $true
     $script:LogTextBox.ScrollBars = [System.Windows.Forms.ScrollBars]::Vertical
     $script:LogTextBox.ReadOnly = $true
     $script:LogTextBox.MaxLength = 0  # Unlimited (we trim in Write-Log)
     $logPanel.Controls.Add($script:LogTextBox)
-    
+
     $statusBar = New-Object System.Windows.Forms.Panel
     $statusBar.Location = New-Object System.Drawing.Point(200, 630)
     $statusBar.Size = New-Object System.Drawing.Size(808, 30)
     $statusBar.BackColor = $script:Colors.WindowBg
-    
+
     $script:StatusLabel = New-Object System.Windows.Forms.Label
     $script:StatusLabel.Text = "Ready"
     $script:StatusLabel.Font = New-Object System.Drawing.Font("Segoe UI", 9)
@@ -3706,12 +4018,12 @@ function Show-MainForm {
     $script:StatusLabel.Location = New-Object System.Drawing.Point(10, 5)
     $script:StatusLabel.AutoSize = $true
     $statusBar.Controls.Add($script:StatusLabel)
-    
+
     $form.Controls.AddRange(@($sidebar, $script:ContentPanel, $logPanel, $statusBar))
-    
+
     Show-ScanPage
     Write-Log "$($script:AppName) started"
-    
+
     [void]$form.ShowDialog()
 }
 #endregion GUI

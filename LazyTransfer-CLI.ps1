@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     LazyTransfer CLI v2.5 — Headless command-line interface
 

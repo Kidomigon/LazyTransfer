@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Edge-case test suite for LazyTransfer v2.5
 
@@ -82,7 +82,7 @@ foreach ($regionName in $engineRegions) {
 }
 
 # ---- Source the NetworkEngine module ----
-$networkEngine = Join-Path $script:ProjectDir "modules" "NetworkEngine.ps1"
+$networkEngine = Join-Path (Join-Path $script:ProjectDir "modules") "NetworkEngine.ps1"
 if (-not (Test-Path $networkEngine)) {
     throw "Cannot find NetworkEngine.ps1 at $networkEngine"
 }

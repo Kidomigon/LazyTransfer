@@ -1,0 +1,960 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>LazyTransfer — The lazy way to move your stuff to a new PC</title>
+    <meta name="description" content="Portable PowerShell tool that scans, exports, and reinstalls programs + files between Windows machines. No cloud, no accounts, just USB and go.">
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:opsz,wght@12..96,200;12..96,400;12..96,700;12..96,800&family=IBM+Plex+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+
+    <style>
+        :root {
+            --bg-deep: #0c0c10;
+            --bg-main: #12121a;
+            --bg-surface: #1a1c20;
+            --bg-card: #22242a;
+            --bg-elevated: #2a2c34;
+            --text-primary: #ebebf2;
+            --text-secondary: #82859a;
+            --text-muted: #555766;
+            --accent-blue: #3898ff;
+            --accent-green: #34d399;
+            --accent-orange: #fb923c;
+            --accent-pink: #f472b6;
+            --accent-sky: #60a5fa;
+            --accent-red: #f87171;
+            --border: #30323a;
+            --font-display: 'Bricolage Grotesque', sans-serif;
+            --font-mono: 'IBM Plex Mono', monospace;
+        }
+
+        * { margin: 0; padding: 0; box-sizing: border-box; }
+
+        html {
+            scroll-behavior: smooth;
+            font-size: 16px;
+        }
+
+        body {
+            font-family: var(--font-display);
+            background: var(--bg-deep);
+            color: var(--text-primary);
+            overflow-x: hidden;
+            -webkit-font-smoothing: antialiased;
+        }
+
+        /* --- GRID BACKGROUND --- */
+        .grid-bg {
+            position: fixed;
+            inset: 0;
+            z-index: 0;
+            background-image:
+                linear-gradient(rgba(56, 152, 255, 0.03) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(56, 152, 255, 0.03) 1px, transparent 1px);
+            background-size: 60px 60px;
+            pointer-events: none;
+        }
+
+        .grid-bg::after {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background: radial-gradient(ellipse 80% 50% at 50% 0%, rgba(56, 152, 255, 0.08), transparent 60%);
+        }
+
+        /* --- LAYOUT --- */
+        .container {
+            max-width: 1100px;
+            margin: 0 auto;
+            padding: 0 24px;
+            position: relative;
+            z-index: 1;
+        }
+
+        section {
+            padding: 100px 0;
+        }
+
+        /* --- NAV --- */
+        nav {
+            position: fixed;
+            top: 0;
+            left: 0;
+            right: 0;
+            z-index: 100;
+            padding: 16px 0;
+            background: rgba(12, 12, 16, 0.85);
+            backdrop-filter: blur(20px);
+            border-bottom: 1px solid rgba(48, 50, 58, 0.5);
+        }
+
+        nav .container {
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .nav-logo {
+            font-family: var(--font-mono);
+            font-weight: 600;
+            font-size: 1.1rem;
+            color: var(--text-primary);
+            text-decoration: none;
+            letter-spacing: -0.02em;
+        }
+
+        .nav-logo span {
+            color: var(--accent-blue);
+        }
+
+        .nav-links {
+            display: flex;
+            align-items: center;
+            gap: 32px;
+            list-style: none;
+        }
+
+        .nav-links a {
+            font-family: var(--font-mono);
+            font-size: 0.8rem;
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s;
+            letter-spacing: 0.02em;
+        }
+
+        .nav-links a:hover {
+            color: var(--text-primary);
+        }
+
+        /* --- HERO --- */
+        .hero {
+            padding: 180px 0 120px;
+            text-align: center;
+        }
+
+        .hero-badge {
+            display: inline-flex;
+            align-items: center;
+            gap: 8px;
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 500;
+            color: var(--accent-green);
+            background: rgba(52, 211, 153, 0.08);
+            border: 1px solid rgba(52, 211, 153, 0.2);
+            padding: 6px 16px;
+            border-radius: 100px;
+            margin-bottom: 32px;
+            letter-spacing: 0.04em;
+        }
+
+        .hero-badge::before {
+            content: '';
+            width: 6px;
+            height: 6px;
+            background: var(--accent-green);
+            border-radius: 50%;
+            animation: pulse-dot 2s ease-in-out infinite;
+        }
+
+        @keyframes pulse-dot {
+            0%, 100% { opacity: 1; transform: scale(1); }
+            50% { opacity: 0.5; transform: scale(0.8); }
+        }
+
+        .hero h1 {
+            font-size: clamp(3rem, 7vw, 5.5rem);
+            font-weight: 800;
+            line-height: 1.05;
+            letter-spacing: -0.04em;
+            margin-bottom: 24px;
+            background: linear-gradient(135deg, var(--text-primary) 0%, var(--accent-blue) 50%, var(--accent-green) 100%);
+            -webkit-background-clip: text;
+            -webkit-text-fill-color: transparent;
+            background-clip: text;
+        }
+
+        .hero p {
+            font-size: 1.25rem;
+            font-weight: 200;
+            color: var(--text-secondary);
+            max-width: 540px;
+            margin: 0 auto 48px;
+            line-height: 1.6;
+        }
+
+        .hero-actions {
+            display: flex;
+            gap: 16px;
+            justify-content: center;
+            flex-wrap: wrap;
+        }
+
+        .btn-primary {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: var(--bg-deep);
+            background: var(--accent-blue);
+            padding: 14px 32px;
+            border-radius: 12px;
+            text-decoration: none;
+            transition: transform 0.15s ease, box-shadow 0.25s ease;
+            border: none;
+            cursor: pointer;
+        }
+
+        .btn-primary:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(56, 152, 255, 0.3);
+        }
+
+        .btn-secondary {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            font-weight: 500;
+            color: var(--text-primary);
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            padding: 14px 32px;
+            border-radius: 12px;
+            text-decoration: none;
+            transition: transform 0.15s ease, border-color 0.25s ease;
+            cursor: pointer;
+        }
+
+        .btn-secondary:hover {
+            transform: translateY(-2px);
+            border-color: var(--text-muted);
+        }
+
+        .btn-icon {
+            width: 18px;
+            height: 18px;
+        }
+
+        /* --- HOW IT WORKS --- */
+        .steps-section {
+            padding: 80px 0;
+        }
+
+        .section-label {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-blue);
+            text-transform: uppercase;
+            letter-spacing: 0.12em;
+            margin-bottom: 16px;
+        }
+
+        .section-title {
+            font-size: clamp(2rem, 4vw, 3rem);
+            font-weight: 700;
+            letter-spacing: -0.03em;
+            margin-bottom: 64px;
+            line-height: 1.1;
+        }
+
+        .steps-grid {
+            display: grid;
+            grid-template-columns: repeat(3, 1fr);
+            gap: 24px;
+        }
+
+        .step-card {
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 36px 28px;
+            position: relative;
+            transition: transform 0.2s ease, border-color 0.3s ease;
+        }
+
+        .step-card:hover {
+            transform: translateY(-4px);
+            border-color: var(--text-muted);
+        }
+
+        .step-number {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 600;
+            color: var(--bg-deep);
+            background: var(--accent-blue);
+            width: 28px;
+            height: 28px;
+            border-radius: 8px;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            margin-bottom: 20px;
+        }
+
+        .step-card:nth-child(2) .step-number { background: var(--accent-green); }
+        .step-card:nth-child(3) .step-number { background: var(--accent-orange); }
+
+        .step-card h3 {
+            font-size: 1.25rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+            letter-spacing: -0.02em;
+        }
+
+        .step-card p {
+            font-size: 0.95rem;
+            font-weight: 200;
+            color: var(--text-secondary);
+            line-height: 1.5;
+        }
+
+        .step-arrow {
+            display: none; /* Could add connecting arrows later */
+        }
+
+        /* --- FEATURES --- */
+        .features-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 24px;
+        }
+
+        .feature-card {
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 36px 32px;
+            transition: transform 0.2s ease, border-color 0.3s ease;
+        }
+
+        .feature-card:hover {
+            transform: translateY(-3px);
+            border-color: var(--text-muted);
+        }
+
+        .feature-icon {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            font-weight: 600;
+            padding: 6px 12px;
+            border-radius: 6px;
+            display: inline-block;
+            margin-bottom: 18px;
+        }
+
+        .feature-card:nth-child(1) .feature-icon {
+            color: var(--accent-blue);
+            background: rgba(56, 152, 255, 0.1);
+            border: 1px solid rgba(56, 152, 255, 0.2);
+        }
+        .feature-card:nth-child(2) .feature-icon {
+            color: var(--accent-orange);
+            background: rgba(251, 146, 60, 0.1);
+            border: 1px solid rgba(251, 146, 60, 0.2);
+        }
+        .feature-card:nth-child(3) .feature-icon {
+            color: var(--accent-pink);
+            background: rgba(244, 114, 182, 0.1);
+            border: 1px solid rgba(244, 114, 182, 0.2);
+        }
+        .feature-card:nth-child(4) .feature-icon {
+            color: var(--accent-sky);
+            background: rgba(96, 165, 250, 0.1);
+            border: 1px solid rgba(96, 165, 250, 0.2);
+        }
+
+        .feature-card h3 {
+            font-size: 1.2rem;
+            font-weight: 700;
+            margin-bottom: 10px;
+            letter-spacing: -0.02em;
+        }
+
+        .feature-card p {
+            font-size: 0.9rem;
+            font-weight: 200;
+            color: var(--text-secondary);
+            line-height: 1.55;
+        }
+
+        .feature-card ul {
+            list-style: none;
+            margin-top: 14px;
+        }
+
+        .feature-card ul li {
+            font-size: 0.85rem;
+            font-weight: 400;
+            color: var(--text-secondary);
+            padding: 4px 0;
+            padding-left: 18px;
+            position: relative;
+        }
+
+        .feature-card ul li::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 11px;
+            width: 5px;
+            height: 5px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        /* --- SCREENSHOT PLACEHOLDER --- */
+        .screenshot-section {
+            padding: 60px 0 100px;
+        }
+
+        .screenshot-placeholder {
+            background: var(--bg-card);
+            border: 1px dashed var(--border);
+            border-radius: 16px;
+            padding: 80px 40px;
+            text-align: center;
+            position: relative;
+            overflow: hidden;
+        }
+
+        .screenshot-placeholder::before {
+            content: '';
+            position: absolute;
+            inset: 0;
+            background:
+                linear-gradient(rgba(56, 152, 255, 0.015) 1px, transparent 1px),
+                linear-gradient(90deg, rgba(56, 152, 255, 0.015) 1px, transparent 1px);
+            background-size: 20px 20px;
+        }
+
+        .screenshot-placeholder p {
+            font-family: var(--font-mono);
+            font-size: 0.85rem;
+            color: var(--text-muted);
+            position: relative;
+        }
+
+        .screenshot-placeholder .mock-window {
+            width: 100%;
+            max-width: 700px;
+            margin: 0 auto;
+            background: var(--bg-surface);
+            border: 1px solid var(--border);
+            border-radius: 12px;
+            overflow: hidden;
+            position: relative;
+        }
+
+        .mock-titlebar {
+            display: flex;
+            align-items: center;
+            gap: 8px;
+            padding: 12px 16px;
+            background: var(--bg-deep);
+            border-bottom: 1px solid var(--border);
+        }
+
+        .mock-dot {
+            width: 10px;
+            height: 10px;
+            border-radius: 50%;
+            background: var(--text-muted);
+        }
+
+        .mock-dot:nth-child(1) { background: var(--accent-red); opacity: 0.7; }
+        .mock-dot:nth-child(2) { background: var(--accent-orange); opacity: 0.7; }
+        .mock-dot:nth-child(3) { background: var(--accent-green); opacity: 0.7; }
+
+        .mock-titlebar span {
+            font-family: var(--font-mono);
+            font-size: 0.7rem;
+            color: var(--text-muted);
+            margin-left: 8px;
+        }
+
+        .mock-body {
+            display: flex;
+            min-height: 300px;
+        }
+
+        .mock-sidebar {
+            width: 140px;
+            background: linear-gradient(180deg, rgba(14, 14, 18, 0.9), rgba(10, 10, 14, 0.9));
+            padding: 16px 0;
+            border-right: 1px solid var(--border);
+            flex-shrink: 0;
+        }
+
+        .mock-nav-item {
+            font-family: var(--font-mono);
+            font-size: 0.65rem;
+            padding: 8px 16px;
+            color: var(--text-muted);
+            position: relative;
+        }
+
+        .mock-nav-item.active {
+            color: var(--accent-blue);
+        }
+
+        .mock-nav-item.active::before {
+            content: '';
+            position: absolute;
+            left: 0;
+            top: 25%;
+            bottom: 25%;
+            width: 2px;
+            background: var(--accent-blue);
+            border-radius: 1px;
+        }
+
+        .mock-content {
+            flex: 1;
+            padding: 24px;
+        }
+
+        .mock-line {
+            height: 8px;
+            border-radius: 4px;
+            margin-bottom: 12px;
+        }
+
+        .mock-line:nth-child(1) {
+            width: 40%;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-green));
+            height: 14px;
+            margin-bottom: 8px;
+        }
+
+        .mock-line:nth-child(2) {
+            width: 65%;
+            background: var(--bg-elevated);
+        }
+
+        .mock-line:nth-child(3) {
+            width: 80%;
+            background: var(--bg-elevated);
+            margin-bottom: 24px;
+        }
+
+        .mock-bar-track {
+            width: 100%;
+            height: 10px;
+            background: var(--bg-elevated);
+            border-radius: 5px;
+            overflow: hidden;
+            margin-top: 20px;
+        }
+
+        .mock-bar-fill {
+            width: 68%;
+            height: 100%;
+            background: linear-gradient(90deg, var(--accent-blue), var(--accent-green));
+            border-radius: 5px;
+            animation: mock-progress 3s ease-in-out infinite;
+        }
+
+        @keyframes mock-progress {
+            0% { width: 20%; }
+            50% { width: 75%; }
+            100% { width: 20%; }
+        }
+
+        .mock-cards {
+            display: grid;
+            grid-template-columns: 1fr 1fr;
+            gap: 12px;
+            margin-top: 16px;
+        }
+
+        .mock-card-box {
+            height: 50px;
+            background: var(--bg-elevated);
+            border-radius: 8px;
+            border: 1px solid var(--border);
+        }
+
+        /* --- REQUIREMENTS --- */
+        .requirements {
+            display: flex;
+            justify-content: center;
+            gap: 48px;
+            flex-wrap: wrap;
+            padding-bottom: 80px;
+        }
+
+        .req-item {
+            text-align: center;
+        }
+
+        .req-item .req-icon {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            font-weight: 600;
+            color: var(--accent-green);
+            background: rgba(52, 211, 153, 0.08);
+            border: 1px solid rgba(52, 211, 153, 0.15);
+            padding: 10px 16px;
+            border-radius: 10px;
+            display: inline-block;
+            margin-bottom: 12px;
+        }
+
+        .req-item h4 {
+            font-size: 0.95rem;
+            font-weight: 700;
+            margin-bottom: 4px;
+            letter-spacing: -0.01em;
+        }
+
+        .req-item p {
+            font-size: 0.8rem;
+            font-weight: 200;
+            color: var(--text-secondary);
+        }
+
+        /* --- SUPPORT / COFFEE --- */
+        .support-section {
+            padding: 60px 0;
+            text-align: center;
+        }
+
+        .coffee-card {
+            display: inline-flex;
+            flex-direction: column;
+            align-items: center;
+            background: var(--bg-card);
+            border: 1px solid var(--border);
+            border-radius: 16px;
+            padding: 40px 48px;
+            transition: border-color 0.3s ease;
+        }
+
+        .coffee-card:hover {
+            border-color: #ffdd00;
+        }
+
+        .coffee-card h3 {
+            font-size: 1.3rem;
+            font-weight: 700;
+            margin-bottom: 8px;
+            letter-spacing: -0.02em;
+        }
+
+        .coffee-card p {
+            font-size: 0.9rem;
+            font-weight: 200;
+            color: var(--text-secondary);
+            margin-bottom: 24px;
+            max-width: 340px;
+        }
+
+        .btn-coffee {
+            display: inline-flex;
+            align-items: center;
+            gap: 10px;
+            font-family: var(--font-mono);
+            font-size: 0.9rem;
+            font-weight: 600;
+            color: #0d0d0d;
+            background: #ffdd00;
+            padding: 14px 32px;
+            border-radius: 12px;
+            text-decoration: none;
+            transition: transform 0.15s ease, box-shadow 0.25s ease;
+            border: none;
+            cursor: pointer;
+        }
+
+        .btn-coffee:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 8px 32px rgba(255, 221, 0, 0.25);
+        }
+
+        .btn-coffee svg {
+            width: 20px;
+            height: 20px;
+        }
+
+        /* --- FOOTER --- */
+        footer {
+            padding: 40px 0;
+            border-top: 1px solid var(--border);
+            text-align: center;
+        }
+
+        footer p {
+            font-family: var(--font-mono);
+            font-size: 0.75rem;
+            color: var(--text-muted);
+            line-height: 2;
+        }
+
+        footer a {
+            color: var(--text-secondary);
+            text-decoration: none;
+            transition: color 0.2s;
+        }
+
+        footer a:hover {
+            color: var(--text-primary);
+        }
+
+        /* --- ANIMATIONS --- */
+        .reveal {
+            opacity: 0;
+            transform: translateY(30px);
+            transition: opacity 0.6s ease, transform 0.6s ease;
+        }
+
+        .reveal.visible {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .reveal-delay-1 { transition-delay: 0.1s; }
+        .reveal-delay-2 { transition-delay: 0.2s; }
+        .reveal-delay-3 { transition-delay: 0.3s; }
+
+        /* --- RESPONSIVE --- */
+        @media (max-width: 768px) {
+            .steps-grid { grid-template-columns: 1fr; }
+            .features-grid { grid-template-columns: 1fr; }
+            .hero { padding: 140px 0 80px; }
+            .hero h1 { font-size: 2.5rem; }
+            .nav-links { display: none; }
+            .requirements { gap: 24px; }
+            .mock-sidebar { display: none; }
+        }
+    </style>
+</head>
+<body>
+
+<div class="grid-bg"></div>
+
+<nav>
+    <div class="container">
+        <a href="#" class="nav-logo"><span>Lazy</span>Transfer</a>
+        <ul class="nav-links">
+            <li><a href="#how-it-works">How It Works</a></li>
+            <li><a href="#features">Features</a></li>
+            <li><a href="https://github.com/Kidomigon/LazyTransfer" target="_blank">GitHub</a></li>
+        </ul>
+    </div>
+</nav>
+
+<!-- HERO -->
+<section class="hero">
+    <div class="container">
+        <div class="hero-badge">v2.5 STABLE</div>
+        <h1>The lazy way to move your stuff.</h1>
+        <p>Drop it on a USB. Scan your old PC. Install everything on the new one. No cloud accounts, no subscriptions, no setup.</p>
+        <div class="hero-actions">
+            <a href="https://github.com/Kidomigon/LazyTransfer/releases/latest/download/LazyTransfer.zip" class="btn-primary">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+                Download .zip
+            </a>
+            <a href="https://github.com/Kidomigon/LazyTransfer" target="_blank" class="btn-secondary">
+                <svg class="btn-icon" viewBox="0 0 24 24" fill="currentColor"><path d="M12 0c-6.626 0-12 5.373-12 12 0 5.302 3.438 9.8 8.207 11.387.599.111.793-.261.793-.577v-2.234c-3.338.726-4.033-1.416-4.033-1.416-.546-1.387-1.333-1.756-1.333-1.756-1.089-.745.083-.729.083-.729 1.205.084 1.839 1.237 1.839 1.237 1.07 1.834 2.807 1.304 3.492.997.107-.775.418-1.305.762-1.604-2.665-.305-5.467-1.334-5.467-5.931 0-1.311.469-2.381 1.236-3.221-.124-.303-.535-1.524.117-3.176 0 0 1.008-.322 3.301 1.23.957-.266 1.983-.399 3.003-.404 1.02.005 2.047.138 3.006.404 2.291-1.552 3.297-1.23 3.297-1.23.653 1.653.242 2.874.118 3.176.77.84 1.235 1.911 1.235 3.221 0 4.609-2.807 5.624-5.479 5.921.43.372.823 1.102.823 2.222v3.293c0 .319.192.694.801.576 4.765-1.589 8.199-6.086 8.199-11.386 0-6.627-5.373-12-12-12z"/></svg>
+                View Source
+            </a>
+        </div>
+    </div>
+</section>
+
+<!-- HOW IT WORKS -->
+<section id="how-it-works" class="steps-section">
+    <div class="container">
+        <div class="section-label reveal">How It Works</div>
+        <h2 class="section-title reveal">Three steps. Two PCs.<br>Zero headache.</h2>
+        <div class="steps-grid">
+            <div class="step-card reveal reveal-delay-1">
+                <div class="step-number">01</div>
+                <h3>Scan</h3>
+                <p>LazyTransfer reads your Windows registry and finds every installed program. Noise like Visual C++ redistributables and .NET runtimes is filtered out automatically.</p>
+            </div>
+            <div class="step-card reveal reveal-delay-2">
+                <div class="step-number">02</div>
+                <h3>Bundle</h3>
+                <p>Your program list, user files, browser bookmarks, and settings are saved as a portable JSON bundle. Copy it to a USB drive or send it over your network.</p>
+            </div>
+            <div class="step-card reveal reveal-delay-3">
+                <div class="step-number">03</div>
+                <h3>Install</h3>
+                <p>On the new PC, load the bundle and hit install. LazyTransfer uses winget or Chocolatey to silently reinstall everything with real-time progress tracking.</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- FEATURES -->
+<section id="features">
+    <div class="container">
+        <div class="section-label reveal">Features</div>
+        <h2 class="section-title reveal">Everything you need,<br>nothing you don't.</h2>
+        <div class="features-grid">
+            <div class="feature-card reveal reveal-delay-1">
+                <div class="feature-icon">PROGRAMS</div>
+                <h3>Program Migration</h3>
+                <p>Smart matching maps your installed apps to package manager IDs. Fuzzy search + a built-in static map handles edge cases.</p>
+                <ul>
+                    <li>10 app categories with toggle filters</li>
+                    <li>winget preferred, Chocolatey fallback</li>
+                    <li>Already-installed detection</li>
+                    <li>Per-app progress with ETA</li>
+                </ul>
+            </div>
+            <div class="feature-card reveal reveal-delay-2">
+                <div class="feature-icon">FILES</div>
+                <h3>Files Migration</h3>
+                <p>Copy Documents, Downloads, Pictures, Videos, Music, and Desktop folders. Export Chrome, Firefox, and Edge bookmarks as raw files.</p>
+                <ul>
+                    <li>ZIP archive or direct robocopy modes</li>
+                    <li>Multithreaded copy (robocopy /MT:4)</li>
+                    <li>Migration manifest for audit trail</li>
+                    <li>Async folder size calculation</li>
+                </ul>
+            </div>
+            <div class="feature-card reveal reveal-delay-1">
+                <div class="feature-icon">NETWORK</div>
+                <h3>Remote Transfer</h3>
+                <p>Three ways to move files over LAN without a USB drive. Start a web server, use direct TCP, or copy via shared folders.</p>
+                <ul>
+                    <li>HTTP server — download from any browser</li>
+                    <li>Direct TCP with binary streaming</li>
+                    <li>UNC shared folder via robocopy</li>
+                    <li>Auto firewall rules</li>
+                </ul>
+            </div>
+            <div class="feature-card reveal reveal-delay-2">
+                <div class="feature-icon">RESTORE</div>
+                <h3>Full Restore</h3>
+                <p>Point at any bundle folder and LazyTransfer auto-detects programs, files, system settings, and bookmarks inside.</p>
+                <ul>
+                    <li>Selective restore — pick what you want</li>
+                    <li>Phased execution (settings → programs → files)</li>
+                    <li>Bookmark restore with auto-backup</li>
+                    <li>Error-resilient — continues on failure</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- SCREENSHOT MOCK -->
+<section class="screenshot-section">
+    <div class="container">
+        <div class="screenshot-placeholder reveal">
+            <div class="mock-window">
+                <div class="mock-titlebar">
+                    <div class="mock-dot"></div>
+                    <div class="mock-dot"></div>
+                    <div class="mock-dot"></div>
+                    <span>LazyTransfer v2.5</span>
+                </div>
+                <div class="mock-body">
+                    <div class="mock-sidebar">
+                        <div class="mock-nav-item active">Scan</div>
+                        <div class="mock-nav-item">Install</div>
+                        <div class="mock-nav-item">Files</div>
+                        <div class="mock-nav-item">Transfer</div>
+                        <div class="mock-nav-item">Restore</div>
+                    </div>
+                    <div class="mock-content">
+                        <div class="mock-line"></div>
+                        <div class="mock-line"></div>
+                        <div class="mock-line"></div>
+                        <div class="mock-cards">
+                            <div class="mock-card-box"></div>
+                            <div class="mock-card-box"></div>
+                        </div>
+                        <div class="mock-bar-track">
+                            <div class="mock-bar-fill"></div>
+                        </div>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- REQUIREMENTS -->
+<section>
+    <div class="container">
+        <div style="text-align: center; margin-bottom: 48px;">
+            <div class="section-label reveal">Requirements</div>
+            <h2 class="section-title reveal">Runs anywhere Windows does.</h2>
+        </div>
+        <div class="requirements">
+            <div class="req-item reveal reveal-delay-1">
+                <div class="req-icon">WIN</div>
+                <h4>Windows 10 / 11</h4>
+                <p>64-bit, any edition</p>
+            </div>
+            <div class="req-item reveal reveal-delay-2">
+                <div class="req-icon">PS5</div>
+                <h4>PowerShell 5.1+</h4>
+                <p>Built into Windows</p>
+            </div>
+            <div class="req-item reveal reveal-delay-3">
+                <div class="req-icon">USB</div>
+                <h4>Fully Portable</h4>
+                <p>No installer needed</p>
+            </div>
+            <div class="req-item reveal reveal-delay-1">
+                <div class="req-icon">ADM</div>
+                <h4>Admin Rights</h4>
+                <p>For program installs</p>
+            </div>
+        </div>
+    </div>
+</section>
+
+<!-- SUPPORT -->
+<section class="support-section">
+    <div class="container">
+        <div class="coffee-card reveal">
+            <h3>Like LazyTransfer?</h3>
+            <p>It's free and always will be. But if it saved you time, a coffee goes a long way.</p>
+            <a href="https://buymeacoffee.com/kidomigon" target="_blank" class="btn-coffee">
+                <svg viewBox="0 0 24 24" fill="currentColor"><path d="M2 21V19H20V21H2ZM20 8V5H18V8H20ZM20 3C20.5304 3 21.0391 3.21071 21.4142 3.58579C21.7893 3.96086 22 4.46957 22 5V8C22 8.53043 21.7893 9.03914 21.4142 9.41421C21.0391 9.78929 20.5304 10 20 10H18V11C18 12.0609 17.5786 13.0783 16.8284 13.8284C16.0783 14.5786 15.0609 15 14 15H8C6.93913 15 5.92172 14.5786 5.17157 13.8284C4.42143 13.0783 4 12.0609 4 11V3H20ZM16 5H6V11C6 11.5304 6.21071 12.0391 6.58579 12.4142C6.96086 12.7893 7.46957 13 8 13H14C14.5304 13 15.0391 12.7893 15.4142 12.4142C15.7893 12.0391 16 11.5304 16 11V5Z"/></svg>
+                Buy me a coffee
+            </a>
+        </div>
+    </div>
+</section>
+
+<!-- FOOTER -->
+<footer>
+    <div class="container">
+        <p>
+            MIT License &middot; <a href="https://github.com/Kidomigon/LazyTransfer">GitHub</a> &middot; Built by <a href="https://github.com/Kidomigon">Kidomigon</a> with <a href="https://claude.com/claude-code">Claude Code</a>
+        </p>
+    </div>
+</footer>
+
+<script>
+    // Scroll reveal
+    const observer = new IntersectionObserver((entries) => {
+        entries.forEach(entry => {
+            if (entry.isIntersecting) {
+                entry.target.classList.add('visible');
+            }
+        });
+    }, { threshold: 0.1, rootMargin: '0px 0px -40px 0px' });
+
+    document.querySelectorAll('.reveal').forEach(el => observer.observe(el));
+</script>
+
+</body>
+</html>

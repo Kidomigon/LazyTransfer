@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Build-Exe.ps1 — Package LazyTransfer into a standalone EXE
 
